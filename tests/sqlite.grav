@@ -1,0 +1,168 @@
+// SQLite through grav-db: values in and out, NULLs, blobs, errors, transactions
+// with savepoints, the statement cache, streaming, a pool shared by threads, and
+// rows into objects with reflection.
+import "std"
+import "../src/db.grav"
+use db.*
+
+enum Role { Guest, Member, Admin }
+
+fn fresh() -> SqliteConnection {
+    let db = Sqlite.open(":memory:")
+    db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, age INTEGER, score REAL, active INTEGER, avatar BLOB, role INTEGER)")
+    db.insert("INSERT INTO users (email, age, score, active, avatar, role) VALUES (?, ?, ?, ?, ?, ?)",
+              ["ada@example.com", 36, 9.5, true, Bytes.fromString("PNG"), Role.Admin])
+    db.insert("INSERT INTO users (email, age) VALUES (?, ?)", ["bob@example.com", null])
+    return db
+}
+
+test "values in and out, NULL and blobs" {
+    if (!Sqlite.available()) { return }
+    let db = fresh()
+    assertEq(db.driver(), "sqlite")
+    assertEq(db.lastInsertId(), 2 as long)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM users") as long, 2 as long)
+    let rows = db.query("SELECT * FROM users ORDER BY id")
+    assertEq(rows.size(), 2)
+    assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,avatar,role")
+    assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, avatar: NULL, role: NULL}")
+    let ada = db.queryOne("SELECT * FROM users WHERE email = ?", ["ada@example.com"])
+    assertEq("${ada.getInt("age")} ${ada.getFloat("score")} ${ada.getBool("active")} ${ada.getString("score")}", "36 9.5 true 9.5")
+    assertEq(ada.getBytes("avatar").toString(), "PNG")
+    assertEq(ada.getInt("role"), (Role.Admin as int) as long)
+    let bob = rows.get(1)
+    assertEq("${bob.isNull("age")} ${bob.getInt("age")} '${bob.getString("age")}' ${bob.get("age") == null}", "true 0 '' true")
+    assertEq(db.queryOne("SELECT * FROM users WHERE id = ?", [99]) == null, true)
+    assertEq(db.execute("UPDATE users SET age = age + 1 WHERE age IS NOT NULL"), 1 as long)
+    assertEq(db.queryOne("SELECT age FROM users WHERE id = 1").getInt("age"), 37 as long)
+    let m = ada.toMap()
+    assertEq("${m["email"]} ${m.size()}", "ada@example.com 7")
+    assertEq(ada.has("email") && !ada.has("nope"), true)
+    let s = db.queryOne("SELECT 'x' || ? AS a, ? AS b, ? AS c", ["y", 2.5, false])
+    assertEq("${s.getString("a")} ${s.getFloat("b")} ${s.getInt("c")}", "xy 2.5 0")
+    db.close()
+}
+
+test "errors name what went wrong" {
+    if (!Sqlite.available()) { return }
+    let db = fresh()
+    let msgs = new Array<string>()
+    try { db.insert("INSERT INTO users (email) VALUES (?)", ["ada@example.com"]) } catch (e: DbError) { msgs.push("${e.code} " + e.message()) }
+    try { db.query("SELECT nope FROM users") } catch (e: DbError) { msgs.push(e.message() + " | " + e.sql) }
+    try { db.query("SELECT * FROM users WHERE id = ?", []) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.query("SELECT ?", [new Array<int>()]) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.exec("CREATE TABLE users (x)") } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.queryOne("SELECT 1 AS a").get("b") } catch (e: ValueError) { msgs.push(e.message()) }
+    try { Sqlite.openReadOnly("/nonexistent/dir/x.db") } catch (e: DbError) { msgs.push("open: ${Str.contains(e.message(), "unable to open")}") }
+    assertEq(Str.join(msgs, "\n"),
+             "2067 UNIQUE constraint failed: users.email\n" +
+             "no such column: nope | SELECT nope FROM users\n" +
+             "the SQL has 1 placeholder(s) but 0 argument(s) were given\n" +
+             "argument 1 is an object of class Array: SQL takes numbers, bools, strings, Bytes and null\n" +
+             "table users already exists\n" +
+             "no column 'b' (the columns are a)\n" +
+             "open: true")
+    db.close()
+    let closed = false
+    try { db.query("SELECT 1") } catch (e: StateError) { closed = true }
+    assertEq(closed, true)
+}
+
+test "transactions, savepoints and rollbacks" {
+    if (!Sqlite.available()) { return }
+    let db = fresh()
+    db.transaction(fn() {
+        db.execute("UPDATE users SET age = 1")
+        let inner = false
+        try {
+            db.transaction(fn() { db.execute("UPDATE users SET age = 2"); throw new ValueError("inner") })
+        } catch (e: ValueError) { inner = true }
+        assertEq(inner, true)
+        assertEq(db.inTransaction(), true)
+    })
+    assertEq(db.queryValue("SELECT MAX(age) FROM users") as long, 1 as long)   // the outer change stays
+    assertEq(db.inTransaction(), false)
+    let outer = false
+    try { db.transaction(fn() { db.execute("DELETE FROM users"); throw new ValueError("boom") }) } catch (e: ValueError) { outer = true }
+    assertEq(outer, true)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM users") as long, 2 as long)
+    db.begin()
+    db.execute("DELETE FROM users WHERE id = 2")
+    db.rollback()
+    assertEq(db.queryValue("SELECT COUNT(*) FROM users") as long, 2 as long)
+    let bad = false
+    try { db.commit() } catch (e: StateError) { bad = true }
+    assertEq(bad, true)
+}
+
+test "statements, streaming and the cache" {
+    if (!Sqlite.available()) { return }
+    let db = Sqlite.open(":memory:")
+    db.exec("CREATE TABLE n (v INTEGER); CREATE INDEX n_v ON n(v)")
+    let st = db.prepare("INSERT INTO n (v) VALUES (?)")
+    db.transaction(fn() { for (i in 0..1000) { st.run([i]) } })
+    st.close()
+    assertEq(db.queryValue("SELECT SUM(v) FROM n") as long, 499500 as long)
+    // A query inside another's each() runs on its own statement.
+    let seen = new Array<string>()
+    db.each("SELECT v FROM n WHERE v < ? ORDER BY v", [3], fn(r: Row) {
+        let twice = db.queryValue("SELECT v * 2 FROM n WHERE v = ?", [r.get("v")]) as long
+        seen.push("${r.getInt("v")}:${twice}")
+    })
+    assertEq(Str.join(seen, " "), "0:0 1:2 2:4")
+    // The same SQL again reuses the prepared statement.
+    for (i in 0..200) { assertEq(db.queryValue("SELECT v FROM n WHERE v = ?", [i]) as long, i as long) }
+    // An exception out of each() leaves the statement ready for the next run.
+    let stopped = false
+    try { db.each("SELECT v FROM n", [], fn(r: Row) { throw new ValueError("stop") }) } catch (e: ValueError) { stopped = true }
+    assertEq(stopped && db.query("SELECT v FROM n").size() == 1000, true)
+    db.close()
+}
+
+test "a pool shared by threads, on a file" {
+    if (!Sqlite.available()) { return }
+    let path = "/tmp/grav-db-test-${Process.pid()}.db"
+    let setup = Sqlite.open(path)
+    setup.exec("PRAGMA journal_mode=WAL; DROP TABLE IF EXISTS hits; CREATE TABLE hits (worker INTEGER, n INTEGER)")
+    setup.close()
+    let pool = new Pool(3, fn() -> Connection => Sqlite.open(path))
+    let threads = new Array<Thread>()
+    for (w in 0..6) {
+        threads.push(Thread.spawn(fn() {
+            for (i in 0..50) {
+                pool.with(fn(c: Connection) { c.execute("INSERT INTO hits (worker, n) VALUES (?, ?)", [w, i]) })
+            }
+        }))
+    }
+    for (t in threads) { t.join() }
+    assertEq(pool.opened() <= 3, true)
+    pool.with(fn(c: Connection) { assertEq(c.queryValue("SELECT COUNT(*) FROM hits") as long, 300 as long) })
+    pool.close()
+    new File(path).delete()
+    new File(path + "-wal").delete()
+    new File(path + "-shm").delete()
+}
+
+class User {
+    public id: long
+    @Column("email")
+    public mail: string
+    public age: long?
+    constructor() { self.id = 0; self.mail = ""; self.age = null }
+}
+
+test "rows into objects through reflection" {
+    if (!Sqlite.available()) { return }
+    let db = fresh()
+    let out = new Array<string>()
+    for (row in db.query("SELECT id, email, age FROM users ORDER BY id")) {
+        let u = new User()
+        for (f in reflect(User).fields()) {
+            let c = f.decorator("Column")
+            let col = c == null ? f.name : c.text(0)
+            if (row.has(col)) { f.set(u, row.get(col)) }
+        }
+        out.push("${u.id} ${u.mail} ${u.age}")
+    }
+    assertEq(Str.join(out, "; "), "1 ada@example.com 36; 2 bob@example.com null")
+}
