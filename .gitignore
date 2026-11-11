@@ -1,0 +1,9 @@
+# test and example binaries
+/tests/*
+!/tests/*.grav
+/examples/*
+!/examples/*.grav
+*.gen.c
+*.db
+*.db-wal
+*.db-shm

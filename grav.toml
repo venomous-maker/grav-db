@@ -1,0 +1,5 @@
+name = "grav-db"
+lib = "src/db.grav"
+paths = ["src"]
+
+[dependencies]

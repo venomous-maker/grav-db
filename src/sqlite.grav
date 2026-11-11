@@ -1,0 +1,411 @@
+// sqlite.grav — SQLite databases (a file, or ":memory:"), using the system's
+// libsqlite3.
+//
+//   let db = Sqlite.open("app.db")             // created if missing
+//   db.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)")
+//   db.insert("INSERT INTO notes (body) VALUES (?)", ["hello"])
+//   print(db.queryValue("SELECT COUNT(*) FROM notes"))
+//
+// libsqlite3 is loaded the first time a database is opened; without it,
+// Sqlite.available() is false and open() throws StateError. A connection keeps
+// the statements it runs prepared, so running the same SQL again skips parsing.
+// INTEGER columns come out as long, REAL as float, TEXT as string, BLOB as
+// Bytes and NULL as null.
+import "std"
+import "database.grav"
+
+namespace db {
+
+    %{
+    #include <dlfcn.h>
+    #include <pthread.h>
+    #include <string.h>
+    typedef struct sqlite3 sqlite3;
+    typedef struct sqlite3_stmt sqlite3_stmt;
+    static struct {
+        int (*open_v2)(const char*, sqlite3**, int, const char*);
+        int (*close_v2)(sqlite3*);
+        int (*prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
+        int (*step)(sqlite3_stmt*);
+        int (*finalize)(sqlite3_stmt*);
+        int (*reset)(sqlite3_stmt*);
+        int (*clear_bindings)(sqlite3_stmt*);
+        int (*bind_int64)(sqlite3_stmt*, int, long long);
+        int (*bind_double)(sqlite3_stmt*, int, double);
+        int (*bind_text)(sqlite3_stmt*, int, const char*, int, void (*)(void*));
+        int (*bind_blob)(sqlite3_stmt*, int, const void*, int, void (*)(void*));
+        int (*bind_null)(sqlite3_stmt*, int);
+        int (*bind_parameter_count)(sqlite3_stmt*);
+        int (*column_count)(sqlite3_stmt*);
+        const char* (*column_name)(sqlite3_stmt*, int);
+        int (*column_type)(sqlite3_stmt*, int);
+        long long (*column_int64)(sqlite3_stmt*, int);
+        double (*column_double)(sqlite3_stmt*, int);
+        const unsigned char* (*column_text)(sqlite3_stmt*, int);
+        const void* (*column_blob)(sqlite3_stmt*, int);
+        int (*column_bytes)(sqlite3_stmt*, int);
+        const char* (*errmsg)(sqlite3*);
+        int (*extended_errcode)(sqlite3*);
+        int (*changes)(sqlite3*);
+        long long (*last_insert_rowid)(sqlite3*);
+        int (*exec)(sqlite3*, const char*, void*, void*, char**);
+        void (*free)(void*);
+        int (*busy_timeout)(sqlite3*, int);
+        const char* (*libversion)(void);
+    } grav_sq;
+    static int grav_sq_ok = 0;
+    static pthread_once_t grav_sq_once = PTHREAD_ONCE_INIT;
+    enum { GRAV_SQ_OK = 0, GRAV_SQ_ROW = 100, GRAV_SQ_DONE = 101 };
+    #define GRAV_SQ_STATIC ((void (*)(void*))0)              /* the value outlives the statement's use of it */
+
+    static void grav_sq_load(void) {
+        static const char* const names[] = { "libsqlite3.so.0", "libsqlite3.so", "libsqlite3.dylib", "libsqlite3.0.dylib", 0 };
+        void* h = 0;
+        for (int i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) return;
+    #define GRAV_SQ_FN(field, name) *(void**)(&grav_sq.field) = dlsym(h, name)
+        GRAV_SQ_FN(open_v2, "sqlite3_open_v2"); GRAV_SQ_FN(close_v2, "sqlite3_close_v2");
+        GRAV_SQ_FN(prepare_v2, "sqlite3_prepare_v2"); GRAV_SQ_FN(step, "sqlite3_step");
+        GRAV_SQ_FN(finalize, "sqlite3_finalize"); GRAV_SQ_FN(reset, "sqlite3_reset");
+        GRAV_SQ_FN(clear_bindings, "sqlite3_clear_bindings"); GRAV_SQ_FN(bind_int64, "sqlite3_bind_int64");
+        GRAV_SQ_FN(bind_double, "sqlite3_bind_double"); GRAV_SQ_FN(bind_text, "sqlite3_bind_text");
+        GRAV_SQ_FN(bind_blob, "sqlite3_bind_blob"); GRAV_SQ_FN(bind_null, "sqlite3_bind_null");
+        GRAV_SQ_FN(bind_parameter_count, "sqlite3_bind_parameter_count");
+        GRAV_SQ_FN(column_count, "sqlite3_column_count"); GRAV_SQ_FN(column_name, "sqlite3_column_name");
+        GRAV_SQ_FN(column_type, "sqlite3_column_type"); GRAV_SQ_FN(column_int64, "sqlite3_column_int64");
+        GRAV_SQ_FN(column_double, "sqlite3_column_double"); GRAV_SQ_FN(column_text, "sqlite3_column_text");
+        GRAV_SQ_FN(column_blob, "sqlite3_column_blob"); GRAV_SQ_FN(column_bytes, "sqlite3_column_bytes");
+        GRAV_SQ_FN(errmsg, "sqlite3_errmsg"); GRAV_SQ_FN(extended_errcode, "sqlite3_extended_errcode");
+        GRAV_SQ_FN(changes, "sqlite3_changes"); GRAV_SQ_FN(last_insert_rowid, "sqlite3_last_insert_rowid");
+        GRAV_SQ_FN(exec, "sqlite3_exec"); GRAV_SQ_FN(free, "sqlite3_free");
+        GRAV_SQ_FN(busy_timeout, "sqlite3_busy_timeout"); GRAV_SQ_FN(libversion, "sqlite3_libversion");
+    #undef GRAV_SQ_FN
+        void** all = (void**)&grav_sq;
+        grav_sq_ok = 1;
+        for (size_t i = 0; i < sizeof grav_sq / sizeof(void*); i++) if (!all[i]) grav_sq_ok = 0;
+    }
+    static int grav_sq_ready(void) { pthread_once(&grav_sq_once, grav_sq_load); return grav_sq_ok; }
+    static const char* grav_sq_copy(const char* s, int n) {
+        if (!s) s = "";
+        if (n < 0) n = (int)strlen(s);
+        char* out = grav_str_alloc((size_t)n + 1);
+        if (!out) abort();
+        memcpy(out, s, (size_t)n);
+        out[n] = 0;
+        return out;
+    }
+    /* Binds a scalar `any` to parameter i: 0 done, else SQLite's code; -1 for a kind it cannot take. */
+    static int grav_sq_bind(sqlite3_stmt* st, int i, GravAny v) {
+        switch (v.tag) {
+            case GRAV_ANY_NULL: return grav_sq.bind_null(st, i);
+            case GRAV_ANY_INT: case GRAV_ANY_ENUM: return grav_sq.bind_int64(st, i, v.v.i);
+            case GRAV_ANY_UINT: return grav_sq.bind_int64(st, i, (long long)v.v.u);
+            case GRAV_ANY_FLOAT: return grav_sq.bind_double(st, i, v.v.f);
+            case GRAV_ANY_BOOL: return grav_sq.bind_int64(st, i, v.v.b ? 1 : 0);
+            case GRAV_ANY_STR: return grav_sq.bind_text(st, i, v.v.s, (int)grav_str_len(v.v.s), GRAV_SQ_STATIC);
+            default: return -1;
+        }
+    }
+    /* Writes the current row's n columns to out[0..n): integers, floats, text (a
+       fresh counted string each) and NULL. A BLOB is left null and counted: the
+       caller makes its Bytes. Returns how many BLOBs there were. */
+    static int grav_sq_fill(sqlite3_stmt* st, int n, GravAny* out) {
+        int blobs = 0;
+        for (int i = 0; i < n; i++) {
+            GravAny a;
+            memset(&a, 0, sizeof a);
+            switch (grav_sq.column_type(st, i)) {
+                case 1: a.tag = GRAV_ANY_INT; a.v.i = grav_sq.column_int64(st, i); break;
+                case 2: a.tag = GRAV_ANY_FLOAT; a.v.f = grav_sq.column_double(st, i); break;
+                case 3: {
+                    const char* p = (const char*)grav_sq.column_text(st, i);
+                    a.tag = GRAV_ANY_STR;
+                    a.v.s = grav_sq_copy(p, grav_sq.column_bytes(st, i));
+                    break;
+                }
+                case 4: blobs++; break;
+                default: break;
+            }
+            out[i] = a;
+        }
+        return blobs;
+    }
+    %}
+
+    // Opening SQLite databases.
+    class Sqlite {
+        // Whether libsqlite3 could be loaded.
+        static fn available() -> bool { return %{ grav_sq_ready() %} as bool; }
+        // The SQLite library's version ("3.46.1").
+        static fn version() -> string {
+            Sqlite.need();
+            return %{ grav_sq_copy(grav_sq.libversion(), -1) %} as string;
+        }
+        // Opens (creating if needed) the database file at `path`, or a private
+        // in-memory one for ":memory:". Waits up to 5 s for a lock other
+        // connections hold before failing with "database is locked".
+        static fn open(path: string) -> SqliteConnection { return Sqlite.openWith(path, 0x2 | 0x4); }
+        // Opens an existing database for reading only.
+        static fn openReadOnly(path: string) -> SqliteConnection { return Sqlite.openWith(path, 0x1); }
+        private static fn openWith(path: string, flags: int) -> SqliteConnection {
+            Sqlite.need();
+            let db: byte* = null;
+            let rc = %{ grav_sq.open_v2(path, (sqlite3**)&db, flags | 0x8000 /* NOMUTEX */ | 0x40 /* URI */, 0) %} as int;
+            if (rc != 0) {
+                let why = db == null ? "out of memory" : %{ grav_sq_copy(grav_sq.errmsg((sqlite3*)db), -1) %} as string;
+                if (db != null) { %{ grav_sq.close_v2((sqlite3*)db); %}; }
+                throw new DbError("cannot open '" + path + "': " + why, rc, "");
+            }
+            %{ grav_sq.busy_timeout((sqlite3*)db, 5000); %};
+            return new SqliteConnection(db, path);
+        }
+        private static fn need() {
+            if (!Sqlite.available()) { throw new StateError("SQLite is not available: libsqlite3 could not be loaded"); }
+        }
+    }
+
+    // A connection to an SQLite database (see Connection for what it can do).
+    class SqliteConnection extends Connection {
+        private db: byte*                        // sqlite3*
+        private cache: HashMap<string, SqliteStatement>
+        private openFlag: bool
+        // The path it was opened with.
+        public path: string
+
+        constructor(db: byte*, path: string) {
+            super();
+            self.db = db;
+            self.path = path;
+            self.cache = new HashMap<string, SqliteStatement>();
+            self.openFlag = true;
+        }
+        destructor() { self.close(); }
+
+        // A new statement for `sql` (yours to run and close).
+        fn prepare(sql: string) -> Statement { return self.make(sql); }
+        fn exec(sql: string) {
+            self.need();
+            let db = self.db;
+            let err: byte* = null;
+            let rc = %{ grav_sq.exec((sqlite3*)db, sql, 0, 0, (char**)&err) %} as int;
+            if (rc != 0) {
+                let why = %{ grav_sq_copy(err ? (const char*)err : grav_sq.errmsg((sqlite3*)db), -1) %} as string;
+                let code = %{ grav_sq.extended_errcode((sqlite3*)db) %} as int;
+                %{ if (err) grav_sq.free(err); %};
+                throw new DbError(why, code, sql);
+            }
+        }
+        fn lastInsertId() -> long { self.need(); let db = self.db; return %{ grav_sq.last_insert_rowid((sqlite3*)db) %} as long; }
+        // Rows the last INSERT, UPDATE or DELETE changed.
+        fn changes() -> long { self.need(); let db = self.db; return %{ grav_sq.changes((sqlite3*)db) %} as long; }
+        fn isOpen() -> bool { return self.openFlag; }
+        fn driver() -> string { return "sqlite"; }
+        // How long (ms) to wait for another connection's lock before failing.
+        fn setBusyTimeout(ms: int) { self.need(); let db = self.db; %{ grav_sq.busy_timeout((sqlite3*)db, ms); %}; }
+        fn close() {
+            if (!self.openFlag) { return; }
+            self.openFlag = false;
+            for (st in self.cache.values()) { st.close(); }
+            self.cache.clear();
+            let db = self.db;
+            %{ grav_sq.close_v2((sqlite3*)db); %};        // (statements still held elsewhere keep it until they close)
+        }
+
+        // A cached statement for `sql`, unless that one is already running (a query
+        // inside another's each()): then a fresh one.
+        protected fn borrow(sql: string) -> Statement {
+            self.need();
+            let st = self.cache.getOr(sql, null);
+            if (st == null) {
+                if (self.cache.size() >= 128) { self.trim(); }
+                st = self.make(sql);
+                st.__cached = true;
+                self.cache.put(sql, st);
+            } else if (st.__inUse) {
+                return self.make(sql);
+            }
+            st.__inUse = true;
+            return st;
+        }
+        protected fn done(st: Statement) {
+            let s = st as SqliteStatement;
+            if (s.__cached) { s.__inUse = false; } else { s.close(); }
+        }
+        private fn trim() {                         // drops the idle half of the cache (any order is fine)
+            let gone = new Array<string>();
+            for (k in self.cache.keys()) {
+                let st = self.cache[k];
+                if (!st.__inUse && gone.size() < 64) { gone.push(k); }
+            }
+            for (k in gone) { self.cache[k].close(); self.cache.remove(k); }
+        }
+        private fn make(sql: string) -> SqliteStatement {
+            self.need();
+            let db = self.db;
+            let h: byte* = null;
+            let rc = %{ grav_sq.prepare_v2((sqlite3*)db, sql, -1, (sqlite3_stmt**)&h, 0) %} as int;
+            if (rc != 0) { throw self.error(sql); }
+            if (h == null) { throw new DbError("no statement in the SQL (only comments or blanks)", 0, sql); }
+            return new SqliteStatement(sql, h, db);
+        }
+        private fn error(sql: string) -> DbError {
+            let db = self.db;
+            return new DbError(%{ grav_sq_copy(grav_sq.errmsg((sqlite3*)db), -1) %} as string,
+                               %{ grav_sq.extended_errcode((sqlite3*)db) %} as int, sql);
+        }
+        private fn need() { if (!self.openFlag) { throw new StateError("the SQLite connection to '" + self.path + "' is closed"); } }
+    }
+
+    // A prepared SQLite statement (see Statement).
+    class SqliteStatement extends Statement {
+        private st: byte*                         // sqlite3_stmt*
+        private db: byte*                         // its sqlite3*, for error messages
+        private cols: Columns                     // the result's columns, made on the first row
+        private closed: bool
+        // Kept by its connection's cache, and lent out now (see SqliteConnection).
+        public __cached: bool
+        public __inUse: bool
+
+        constructor(sql: string, st: byte*, db: byte*) {
+            super(sql);
+            self.st = st;
+            self.db = db;
+            self.cols = null;
+            self.closed = false;
+            self.__cached = false;
+            self.__inUse = false;
+        }
+        destructor() { self.close(); }
+
+        fn run(args: Array<any>) -> long {
+            self.start(args);
+            let st = self.st;
+            let rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int;
+            while (rc == 100) { rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int; }   // (rows are not wanted)
+            if (rc != 101) { throw self.finish(true); }
+            self.finish(false);
+            let db = self.db;
+            return %{ grav_sq.changes((sqlite3*)db) %} as long;
+        }
+        fn query(args: Array<any>) -> ResultSet {
+            self.start(args);
+            let st = self.st;
+            let cols = self.columns();
+            let n = cols.size();
+            let vals = new Array<any>();
+            let count = 0;
+            let rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int;
+            while (rc == 100) {
+                self.fill(vals, n);
+                count += 1;
+                rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int;
+            }
+            if (rc != 101) { throw self.finish(true); }
+            self.finish(false);
+            return new ResultSet(cols, vals, count);
+        }
+        fn queryOne(args: Array<any>) -> Row {
+            self.start(args);
+            let st = self.st;
+            let rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int;
+            if (rc == 101) { self.finish(false); return null; }
+            if (rc != 100) { throw self.finish(true); }
+            let cols = self.columns();
+            let vals = new Array<any>(cols.size());
+            self.fill(vals, cols.size());
+            self.finish(false);
+            return new Row(cols, vals, 0);
+        }
+        fn each(args: Array<any>, f: fn(Row)) {
+            self.start(args);
+            let st = self.st;
+            let cols = self.columns();
+            let n = cols.size();
+            let rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int;
+            while (rc == 100) {
+                let vals = new Array<any>(n);              // (each row its own: one kept past the call stays right)
+                self.fill(vals, n);
+                try { f(new Row(cols, vals, 0)); } catch (e: Exception) { self.finish(false); throw e; }
+                rc = %{ grav_sq.step((sqlite3_stmt*)st) %} as int;
+            }
+            if (rc != 101) { throw self.finish(true); }
+            self.finish(false);
+        }
+        fn close() {
+            if (self.closed) { return; }
+            self.closed = true;
+            let st = self.st;
+            %{ grav_sq.finalize((sqlite3_stmt*)st); %};
+        }
+
+        // Binds `args` to the `?`s (their count must match).
+        private fn start(args: Array<any>) {
+            if (self.closed) { throw new StateError("the statement is closed: " + self.sql); }
+            let st = self.st;
+            let want = %{ grav_sq.bind_parameter_count((sqlite3_stmt*)st) %} as int;
+            if (args.size() != want) {
+                throw new DbError("the SQL has ${want} placeholder(s) but ${args.size()} argument(s) were given", 0, self.sql);
+            }
+            for (i, a in args) {
+                let k = i + 1;
+                let rc = %{ grav_sq_bind((sqlite3_stmt*)st, k, a) %} as int;   // scalars in one call
+                if (rc == -1 && a is Bytes) {
+                    let b = a as Bytes;
+                    let p = b.rawData();
+                    let n = b.size();
+                    rc = %{ grav_sq.bind_blob((sqlite3_stmt*)st, k, p, n, GRAV_SQ_STATIC) %} as int;
+                }
+                if (rc == -1) {
+                    self.finish(false);
+                    let t = typename(a);                        // "std.collections.Array$int" -> "Array"
+                    let dot = Str.lastIndexOf(t, ".");
+                    if (dot >= 0) { t = t[dot + 1..]; }
+                    let gen = Str.indexOf(t, "$");
+                    if (gen > 0) { t = t[..gen]; }
+                    throw new DbError("argument ${k} is " + (a is fn() ? "a function" : "an object of class " + t) +
+                                      ": SQL takes numbers, bools, strings, Bytes and null", 0, self.sql);
+                }
+                if (rc != 0) { throw self.finish(true); }
+            }
+        }
+        // Resets it for the next run (and forgets the arguments); with `failed`,
+        // the error the database reports.
+        private fn finish(failed: bool) -> DbError {
+            let st = self.st;
+            let db = self.db;
+            let err: DbError = null;
+            if (failed) {
+                err = new DbError(%{ grav_sq_copy(grav_sq.errmsg((sqlite3*)db), -1) %} as string,
+                                  %{ grav_sq.extended_errcode((sqlite3*)db) %} as int, self.sql);
+            }
+            %{ grav_sq.reset((sqlite3_stmt*)st); grav_sq.clear_bindings((sqlite3_stmt*)st); %};
+            return err;
+        }
+        private fn columns() -> Columns {
+            let st = self.st;
+            let n = %{ grav_sq.column_count((sqlite3_stmt*)st) %} as int;
+            if (self.cols == null || self.cols.names.size() != n) {
+                let names = new Array<string>(n);
+                for (i in 0..n) { names.push(%{ grav_sq_copy(grav_sq.column_name((sqlite3_stmt*)st, i), -1) %} as string); }
+                self.cols = new Columns(names);
+            }
+            return self.cols;
+        }
+        // Appends the current row's n values to `vals` (filled in C; BLOBs become Bytes here).
+        private fn fill(vals: Array<any>, n: int) {
+            let at = vals.size();
+            vals.reserve(at + n);
+            let st = self.st;
+            let blobs = %{ grav_sq_fill((sqlite3_stmt*)st, n, (GravAny*)vals->data + vals->len) %} as int;
+            %{ vals->len += n; %};
+            if (blobs == 0) { return; }
+            for (i in 0..n) {
+                if (%{ grav_sq.column_type((sqlite3_stmt*)st, i) %} as int != 4) { continue; }
+                let b = new Bytes();
+                let len = %{ grav_sq.column_bytes((sqlite3_stmt*)st, i) %} as int;
+                if (len > 0) { b.appendRaw(%{ (unsigned char*)grav_sq.column_blob((sqlite3_stmt*)st, i) %} as byte*, len); }
+                vals.set(at + i, b);
+            }
+        }
+    }
+}
