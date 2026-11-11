@@ -1,0 +1,366 @@
+// database.grav — what every grav-db driver offers (SQLite today; MySQL/MariaDB
+// and PostgreSQL next): connections, statements with `?` placeholders, results,
+// transactions, and a pool that shares connections between threads.
+//
+//   let db = Sqlite.open("app.db")
+//   db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT, age INTEGER)")
+//   let id = db.insert("INSERT INTO users (email, age) VALUES (?, ?)", ["ada@example.com", 36])
+//   for (row in db.query("SELECT email, age FROM users WHERE age > ?", [18])) {
+//       print(row.getString("email") + " " + "${row.getInt("age")}")
+//   }
+//   db.transaction(fn() { db.execute("UPDATE users SET age = age + 1") })
+//
+// Values go in and come out as `any`: whole numbers, floats, bools, strings,
+// Bytes and null (an enum goes in as its number). A connection is used by one
+// thread at a time; Pool lends connections to many.
+import "std"
+
+namespace db {
+
+    // A database failure: SQL the database rejects, a constraint it enforces, a
+    // lost connection. `code` is the driver's own number for it (SQLite's
+    // extended result code, MySQL's errno, ...), `sql` the statement involved.
+    class DbError extends Exception {
+        public code: int
+        public sql: string
+        constructor(m: string, code: int, sql: string) {
+            super(m);
+            self.code = code;
+            self.sql = sql;
+        }
+        // "DbError".
+        public fn kind() -> string { return "DbError"; }
+    }
+
+    // The column names of a result, shared by its rows.
+    class Columns {
+        public names: Array<string>
+        private index: HashMap<string, int>
+        constructor(names: Array<string>) {
+            self.names = names;
+            self.index = new HashMap<string, int>();
+            for (i, n in names) { if (!self.index.containsKey(n)) { self.index.put(n, i); } }
+        }
+        // The position of column `name`, or -1.
+        fn find(name: string) -> int { return self.index.getOr(name, -1); }
+        fn size() -> int { return self.names.size(); }
+    }
+
+    // One row of a result: its values by column name or position. Reading a
+    // column that is not there is a ValueError.
+    class Row {
+        private cols: Columns
+        private vals: Array<any>                  // the values of its result (or its own), row after row
+        private base: int                         // where this row's start
+        constructor(cols: Columns, vals: Array<any>, base: int) { self.cols = cols; self.vals = vals; self.base = base; }
+        // The number of columns.
+        fn size() -> int { return self.cols.size(); }
+        // The column names, in order.
+        fn columns() -> Array<string> { return self.cols.names; }
+        // Whether the row has a column called `name`.
+        fn has(name: string) -> bool { return self.cols.find(name) >= 0; }
+        // The value of column `name` (null for SQL NULL).
+        fn get(name: string) -> any { return self.vals[self.base + self.pos(name)]; }
+        // The value of column i (from 0).
+        fn at(i: int) -> any {
+            if (i < 0 || i >= self.cols.size()) { throw new ValueError("no column ${i} (the row has ${self.cols.size()})"); }
+            return self.vals[self.base + i];
+        }
+        // Whether column `name` is NULL.
+        fn isNull(name: string) -> bool { return self.get(name) == null; }
+        // Column `name` as text: numbers and bools as their text, NULL as "".
+        fn getString(name: string) -> string {
+            let v = self.get(name);
+            if (v is string) { return v as string; }
+            if (v == null) { return ""; }
+            return "${v}";
+        }
+        // Column `name` as a whole number (0 for NULL; text is parsed, ValueError if it is not a number).
+        fn getInt(name: string) -> long {
+            let v = self.get(name);
+            if (v is long) { return v as long; }
+            if (v == null) { return 0; }
+            if (v is int) { return (v as int) as long; }
+            if (v is float) { return (v as float) as long; }
+            if (v is bool) { return (v as bool) ? 1 : 0; }
+            if (v is string) {
+                let s = Str.trim(v as string);
+                let bad: long = -9223372036854775807;
+                let n = Format.toLongOr(s, bad);
+                if (n == bad && s != "-9223372036854775807") { throw new ValueError("column '" + name + "' is not a number: '" + s + "'"); }
+                return n;
+            }
+            throw new ValueError("column '" + name + "' is not a number");
+        }
+        // Column `name` as a float (0 for NULL).
+        fn getFloat(name: string) -> float {
+            let v = self.get(name);
+            if (v is float) { return v as float; }
+            if (v == null) { return 0.0; }
+            if (v is long) { return (v as long) as float; }
+            if (v is int) { return (v as int) as float; }
+            if (v is string) { return Format.toFloatOr(v as string, 0.0); }
+            throw new ValueError("column '" + name + "' is not a number");
+        }
+        // Column `name` as a bool: nonzero numbers, "1", "t", "true", "y", "yes" are true.
+        fn getBool(name: string) -> bool {
+            let v = self.get(name);
+            if (v == null) { return false; }
+            if (v is bool) { return v as bool; }
+            if (v is string) {
+                let s = Str.lower(v as string);
+                return s == "1" || s == "t" || s == "true" || s == "y" || s == "yes";
+            }
+            return self.getInt(name) != 0;
+        }
+        // Column `name` as bytes (text as its UTF-8 bytes; empty for NULL).
+        fn getBytes(name: string) -> Bytes {
+            let v = self.get(name);
+            if (v is Bytes) { return v as Bytes; }
+            if (v == null) { return new Bytes(); }
+            return Bytes.fromString(self.getString(name));
+        }
+        // The row as a map from column name to value.
+        fn toMap() -> HashMap<string, any> {
+            let m = new HashMap<string, any>();
+            for (i, n in self.cols.names) { m.put(n, self.vals[self.base + i]); }
+            return m;
+        }
+        fn toString() -> string {
+            let parts = new Array<string>();
+            for (i, n in self.cols.names) {
+                let v = self.vals[self.base + i];
+                parts.push(n + ": " + (v == null ? "NULL" : v is string ? "\"" + (v as string) + "\"" : "${v}"));
+            }
+            return "{" + Str.join(parts, ", ") + "}";
+        }
+        private fn pos(name: string) -> int {
+            let i = self.cols.find(name);
+            if (i < 0) { throw new ValueError("no column '" + name + "' (the columns are " + Str.join(self.cols.names, ", ") + ")"); }
+            return i;
+        }
+    }
+
+    // The rows of a query, in order: `for (row in result)` works. Its values are
+    // kept in one array, row after row; a Row is a view of its part.
+    class ResultSet {
+        // The column names.
+        public columns: Array<string>
+        private cols: Columns
+        private vals: Array<any>
+        private count: int
+        constructor(cols: Columns, vals: Array<any>, count: int) {
+            self.cols = cols;
+            self.columns = cols.names;
+            self.vals = vals;
+            self.count = count;
+        }
+        // The number of rows.
+        fn size() -> int { return self.count; }
+        fn isEmpty() -> bool { return self.count == 0; }
+        // Row i (from 0).
+        fn get(i: int) -> Row {
+            if (i < 0 || i >= self.count) { throw new IndexError("no row ${i} (the result has ${self.count})"); }
+            return new Row(self.cols, self.vals, i * self.cols.size());
+        }
+        // The first row, or null when there are none.
+        fn first() -> Row { return self.count == 0 ? null : self.get(0); }
+        // Every row, as an array.
+        fn toArray() -> Array<Row> {
+            let out = new Array<Row>(self.count);
+            for (i in 0..self.count) { out.push(self.get(i)); }
+            return out;
+        }
+        fn toString() -> string {
+            let parts = new Array<string>();
+            for (i in 0..self.count) { parts.push(self.get(i).toString()); }
+            return "[" + Str.join(parts, ", ") + "]";
+        }
+    }
+
+    // A prepared statement: SQL parsed once, run many times with new arguments.
+    // `?` marks each argument's place. Close it when done (closing its
+    // connection closes it too).
+    abstract class Statement {
+        // The SQL as given.
+        public sql: string
+        constructor(sql: string) { self.sql = sql; }
+        // Runs it with `args`; the number of rows it changed.
+        abstract fn run(args: Array<any>) -> long
+        // Runs it with `args` and collects every row.
+        abstract fn query(args: Array<any>) -> ResultSet
+        // Runs it with `args` and returns its first row (or null), reading no further.
+        abstract fn queryOne(args: Array<any>) -> Row
+        // Runs it with `args`, calling `f` with each row as it is read (nothing is
+        // collected: for results too big to hold).
+        abstract fn each(args: Array<any>, f: fn(Row))
+        // Frees it; using it afterwards is a StateError.
+        abstract fn close()
+    }
+
+    // A connection to a database. Drivers (Sqlite, ...) make them; this class
+    // holds what they share. One thread uses a connection at a time.
+    abstract class Connection {
+        private depth: int                       // open transactions (savepoints nest inside the first)
+        constructor() { self.depth = 0; }
+
+        // A statement for `sql`, parsed now: yours to run and close.
+        abstract fn prepare(sql: string) -> Statement
+        // Runs one or more statements separated by `;`, without arguments or results
+        // (schema scripts, PRAGMAs).
+        abstract fn exec(sql: string)
+        // The id the last INSERT gave its row.
+        abstract fn lastInsertId() -> long
+        // Closes the connection and its statements (also done when it is freed).
+        abstract fn close()
+        // Whether it is still open.
+        abstract fn isOpen() -> bool
+        // "sqlite", "mysql", "postgres".
+        abstract fn driver() -> string
+        // A statement for one call (the driver may lend a cached one, so the caller
+        // must not keep it); `done(st)` hands it back.
+        protected fn borrow(sql: string) -> Statement { return self.prepare(sql); }
+        protected fn done(st: Statement) { st.close(); }
+
+        // Every row of `sql` run with `args`.
+        fn query(sql: string, args: Array<any> = new Array<any>()) -> ResultSet {
+            let st = self.borrow(sql);
+            try { let r = st.query(args); self.done(st); return r; } catch (e: Exception) { self.done(st); throw e; }
+        }
+        // The first row of `sql`, or null when it has none (no more rows are read).
+        fn queryOne(sql: string, args: Array<any> = new Array<any>()) -> Row {
+            let st = self.borrow(sql);
+            try { let r = st.queryOne(args); self.done(st); return r; } catch (e: Exception) { self.done(st); throw e; }
+        }
+        // The first column of the first row (`SELECT COUNT(*) ...`), or null.
+        fn queryValue(sql: string, args: Array<any> = new Array<any>()) -> any {
+            let r = self.queryOne(sql, args);
+            return r == null || r.size() == 0 ? null : r.at(0);
+        }
+        // Runs `sql` with `args`; the number of rows it changed.
+        fn execute(sql: string, args: Array<any> = new Array<any>()) -> long {
+            let st = self.borrow(sql);
+            try { let n = st.run(args); self.done(st); return n; } catch (e: Exception) { self.done(st); throw e; }
+        }
+        // Runs an INSERT with `args`; the new row's id.
+        fn insert(sql: string, args: Array<any> = new Array<any>()) -> long {
+            self.execute(sql, args);
+            return self.lastInsertId();
+        }
+        // Calls `f` with each row of `sql` as it is read, without collecting them.
+        fn each(sql: string, args: Array<any>, f: fn(Row)) {
+            let st = self.borrow(sql);
+            try { st.each(args, f); self.done(st); } catch (e: Exception) { self.done(st); throw e; }
+        }
+
+        // Runs `body` in a transaction: committed when it returns, rolled back when
+        // it throws (and the exception goes on). Inside another transaction it is a
+        // savepoint, so only its own changes are undone.
+        fn transaction(body: fn()) {
+            self.begin();
+            try {
+                body();
+            } catch (e: Exception) {
+                self.rollback();
+                throw e;
+            }
+            self.commit();
+        }
+        // Starts a transaction (or, inside one, a savepoint).
+        fn begin() {
+            if (self.depth == 0) { self.exec(self.beginSql()); } else { self.exec("SAVEPOINT grav_sp${self.depth}"); }
+            self.depth += 1;
+        }
+        // Commits the innermost transaction or savepoint.
+        fn commit() {
+            if (self.depth == 0) { throw new StateError("commit without a transaction"); }
+            self.depth -= 1;
+            if (self.depth == 0) { self.exec("COMMIT"); } else { self.exec("RELEASE SAVEPOINT grav_sp${self.depth}"); }
+        }
+        // Undoes the innermost transaction or savepoint.
+        fn rollback() {
+            if (self.depth == 0) { throw new StateError("rollback without a transaction"); }
+            self.depth -= 1;
+            if (self.depth == 0) { self.exec("ROLLBACK"); }
+            else { self.exec("ROLLBACK TO SAVEPOINT grav_sp${self.depth}"); self.exec("RELEASE SAVEPOINT grav_sp${self.depth}"); }
+        }
+        // Whether a transaction is open.
+        fn inTransaction() -> bool { return self.depth > 0; }
+        // The statement that starts a transaction ("BEGIN").
+        protected fn beginSql() -> string { return "BEGIN"; }
+        // `name` quoted as an identifier for this database ("users" -> "\"users\"").
+        fn quote(name: string) -> string { return "\"" + Str.replace(name, "\"", "\"\"") + "\""; }
+    }
+
+    // Connections shared by threads. `with` lends one to a function and takes it
+    // back; at most `max` are open at once, and a thread that finds all of them
+    // lent out waits for one.
+    class Pool {
+        private factory: fn() -> Connection
+        private idle: Array<Connection>
+        private lock: Mutex
+        private slots: Semaphore
+        private made: AtomicInt
+        // The most connections it opens.
+        public max: int
+
+        constructor(max: int, factory: fn() -> Connection) {
+            if (max < 1) { throw new ValueError("a pool needs at least one connection"); }
+            self.factory = factory;
+            self.idle = new Array<Connection>();
+            self.lock = new Mutex();
+            self.slots = new Semaphore(max);
+            self.made = new AtomicInt(0);
+            self.max = max;
+        }
+        // A connection for this thread (waits while all are lent out); give it back with release().
+        fn acquire() -> Connection {
+            self.slots.acquire();
+            self.lock.lock();
+            let c: Connection = null;
+            while (self.idle.size() > 0 && c == null) {
+                let x = self.idle.pop();
+                if (x.isOpen()) { c = x; }
+            }
+            self.lock.unlock();
+            if (c == null) {
+                try { c = self.factory(); } catch (e: Exception) { self.slots.release(); throw e; }
+                self.made.increment();
+            }
+            return c;
+        }
+        // Takes back a connection from acquire(). One left inside a transaction is
+        // rolled back first.
+        fn release(c: Connection) {
+            if (c.isOpen() && c.inTransaction()) {
+                try { while (c.inTransaction()) { c.rollback(); } } catch (e: Exception) { c.close(); }
+            }
+            self.lock.lock();
+            if (c.isOpen()) { self.idle.push(c); }
+            self.lock.unlock();
+            self.slots.release();
+        }
+        // Lends a connection to `body`, taking it back afterwards (also when body throws).
+        fn with(body: fn(Connection)) {
+            let c = self.acquire();
+            try { body(c); } catch (e: Exception) { self.release(c); throw e; }
+            self.release(c);
+        }
+        // Connections opened so far.
+        fn opened() -> int { return self.made.get() as int; }
+        // Connections waiting to be lent.
+        fn idleCount() -> int {
+            self.lock.lock();
+            let n = self.idle.size();
+            self.lock.unlock();
+            return n;
+        }
+        // Closes the idle connections (lent ones close when they come back closed).
+        fn close() {
+            self.lock.lock();
+            for (c in self.idle) { c.close(); }
+            self.idle.clear();
+            self.lock.unlock();
+        }
+    }
+}
