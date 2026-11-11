@@ -1,0 +1,22 @@
+// A small notes store: run with `grav run examples/notes.grav` from this
+// directory (or `grav examples/notes.grav --emit bin -o notes && ./notes`).
+import "std"
+import "../src/db.grav"
+use db.*
+
+fn main() {
+    let c = Sqlite.open(":memory:")
+    c.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT NOT NULL, body TEXT, pinned INTEGER DEFAULT 0)")
+    let add = c.prepare("INSERT INTO notes (title, body, pinned) VALUES (?, ?, ?)")
+    c.transaction(fn() {
+        add.run(["groceries", "eggs, milk", true])
+        add.run(["ideas", null, false])
+        add.run(["todo", "ship grav-db", true])
+    })
+    add.close()
+    for (row in c.query("SELECT id, title, body FROM notes WHERE pinned = ? ORDER BY id", [true])) {
+        print("#${row.getInt("id")} " + row.getString("title") + ": " + (row.isNull("body") ? "(empty)" : row.getString("body")))
+    }
+    print("${c.queryValue("SELECT COUNT(*) FROM notes")} notes")
+    c.close()
+}
