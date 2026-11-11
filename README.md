@@ -2,8 +2,8 @@
 
 Databases for [Grav](https://github.com/venomous-maker/grav): connections,
 prepared statements with `?` placeholders, results, transactions with
-savepoints, and a connection pool for threads. The first driver is **SQLite**;
-**MySQL/MariaDB** and **PostgreSQL** come next, behind the same API, so code
+savepoints, and a connection pool for threads. The drivers are **SQLite** and
+**MySQL/MariaDB**, with **PostgreSQL** next, behind the same API, so code
 written against one moves to the others. It is the base for an ORM: rows fill
 objects through Grav's reflection (`reflect(User).fields()`).
 
@@ -39,8 +39,16 @@ fn main() {
 }
 ```
 
-SQLite needs the system's `libsqlite3` (loaded when the first database is
-opened; `Sqlite.available()` says whether it could be).
+For a MySQL or MariaDB server, open a URL instead; the rest is the same:
+
+```grav
+let db = MySql.open("mysql://app:secret@localhost/shop")
+```
+
+SQLite needs the system's `libsqlite3`, and MySQL a client library
+(`libmariadb`, as in Debian's `libmariadb3`, or `libmysqlclient`). Each is
+loaded when the first connection is made; `Sqlite.available()` and
+`MySql.available()` say whether it could be.
 
 ## The API
 
@@ -49,6 +57,15 @@ private in-memory database), `Sqlite.openReadOnly(path)`, `Sqlite.version()`.
 A connection waits up to 5 s for another connection's lock before failing
 (`setBusyTimeout(ms)`); for several writers on one file, use WAL mode
 (`PRAGMA journal_mode=WAL`) and a `Pool`.
+
+**Connecting to MySQL or MariaDB.** `MySql.open(url)` takes
+`mysql://user:password@host:port/database` (`mariadb://` too; the port is 3306
+unless given), with `?socket=/run/mysqld/mysqld.sock` and `?timeout=seconds`.
+Escape any of `:@/?#` in the password as `%XX`. `localhost` means the local
+Unix socket. `MySql.connect(options)` takes a `MySqlOptions` (`host`, `port`,
+`user`, `password`, `database`, `socket`, `connectTimeout`) instead. A
+connection talks utf8mb4, has `ping()`, `serverVersion()` and `changes()`, and
+refuses `LOAD DATA LOCAL`.
 
 **Arguments** go in a list, one per `?`: numbers, bools, strings, `Bytes`,
 `null` and `T?` values (an enum goes in as its number). The count must match
@@ -67,7 +84,12 @@ A `Row` gives `get(name)` (an `any`; `null` for SQL NULL), `at(i)`,
 `isNull(name)`, `getString`, `getInt` (a `long`), `getFloat`, `getBool`,
 `getBytes`, `has(name)`, `columns()` and `toMap()`. A column that is not there
 is a `ValueError`. SQLite values come out as `long` (INTEGER), `float` (REAL),
-`string` (TEXT), `Bytes` (BLOB) and `null`.
+`string` (TEXT), `Bytes` (BLOB) and `null`. MySQL values come out as `long`
+(the integer types, YEAR and BIT; a `BIGINT UNSIGNED` above the `long` range
+as a `ulong`), `float` (FLOAT, DOUBLE), `Bytes` (BINARY, VARBINARY and the
+BLOBs), `null`, and `string` for the rest: text, DECIMAL (exact, so it is not
+rounded through a float; `getFloat` converts it, `getInt` a whole one) and dates and
+times.
 
 **Writing.** `execute(sql, args)` returns the rows changed, `insert(sql, args)`
 the new row's id, `exec(sql)` runs a script of statements without arguments.
@@ -75,7 +97,13 @@ the new row's id, `exec(sql)` runs a script of statements without arguments.
 **Prepared statements.** `prepare(sql)` parses once; `run(args)`,
 `query(args)`, `queryOne(args)` and `each(args, f)` reuse it; `close()` frees
 it. Connections also keep the statements they run prepared, so repeating the
-same SQL through `query` or `execute` costs no parsing.
+same SQL through `query` or `execute` costs no parsing. A MySQL statement finds
+its `?`s once (not those in quotes, backticks or comments) and writes each
+run's arguments into the SQL as escaped literals: strings through the server's
+own escaping for the connection's character set, `Bytes` as hex. A query is
+one round trip, and the server keeps nothing between runs. MySQL reads a
+query's rows whole before `each()` hands them out, so another query can run
+inside it.
 
 **Transactions.** `transaction(fn)` commits when the function returns and rolls
 back when it throws (the exception goes on). A transaction inside another is a
@@ -84,7 +112,9 @@ savepoint: only its own changes are undone. `begin()`, `commit()`,
 
 **Errors** are `DbError`s with the database's message, its `code` (SQLite's
 extended code: 2067 for UNIQUE, 787 for a foreign key, 5 for "database is
-locked") and the `sql`. Using a closed connection is a `StateError`.
+locked"; MySQL's error number: 1062 for a duplicate key, 1452 for a foreign
+key, 1213 for a deadlock, 2002 and 2003 for a server it cannot reach) and the
+`sql`. Using a closed connection is a `StateError`.
 
 **Threads.** A connection is for one thread at a time. `new Pool(max, factory)`
 lends connections: `pool.with(fn(c) { ... })` takes one (opening it if none is
@@ -104,17 +134,34 @@ on the same in-memory database:
 | peak memory, holding all 100,000 rows | 26 MiB | 35 MiB |
 
 A result keeps its values in one array, row after row (a `Row` is a view of its
-part), and each row is filled in C. `each()` streams rows in constant memory.
+part), and each row is filled in C. SQLite's `each()` streams rows in constant
+memory.
+
+Against MariaDB 11.8 on the same machine (over its Unix socket, InnoDB),
+compared with Python's `MySQLdb` (mysqlclient, written in C), best of three:
+
+| | grav-db | Python |
+|---|---|---|
+| insert 100,000 rows in a transaction, one at a time | 11.6 s | 13.8 s |
+| read 100,000 rows of 4 columns | 0.11 s | 0.15 s |
+| 20,000 lookups by primary key | 1.6 s | 2.0 s |
+| peak memory, holding all 100,000 rows | 35 MiB | 47 MiB |
+
+Single-row inserts and lookups wait on the server, one round trip each, for
+both clients.
 
 ## Tests
 
 ```bash
 grav test tests/sqlite.grav
+GRAV_DB_MYSQL='mysql://user:password@localhost/grav_test' grav test tests/mysql.grav
 ```
 
 They cover values in and out, NULLs and blobs, errors, transactions and
-savepoints, the statement cache, streaming, a pool shared by threads on a file,
-and rows into objects through reflection.
+savepoints, the statement cache, streaming, a pool shared by threads, and rows
+into objects through reflection. The MySQL tests make and drop their own
+`gdb_*` tables in the database the URL names. Without `GRAV_DB_MYSQL`, only
+the tests that need no server run: URLs and connection errors.
 
 ## License
 
