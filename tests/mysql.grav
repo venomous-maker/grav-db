@@ -1,0 +1,186 @@
+// MySQL and MariaDB through grav-db. URLs and connection errors need no server;
+// the rest runs against the one GRAV_DB_MYSQL names, as a URL
+// ("mysql://user:password@localhost/grav_test"), and is skipped without it. It
+// creates and drops its own tables (gdb_*) in that database.
+import "std"
+import "../src/db.grav"
+use db.*
+
+enum Role { Guest, Member, Admin }
+
+fn server() -> MySqlConnection {
+    let url = env("GRAV_DB_MYSQL")
+    if (url == "" || !MySql.available()) { return null }
+    return MySql.open(url)
+}
+
+fn fresh() -> MySqlConnection {
+    let db = server()
+    if (db == null) { return null }
+    db.exec("DROP TABLE IF EXISTS gdb_users; " +
+            "CREATE TABLE gdb_users (id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(100) NOT NULL UNIQUE, age INT, " +
+            "score DOUBLE, active BOOLEAN, avatar BLOB, role INT, note TEXT, price DECIMAL(10,2), born DATE, big BIGINT UNSIGNED, flags BIT(8))")
+    db.insert("INSERT INTO gdb_users (email, age, score, active, avatar, role, note, price, born, big, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, b'101')",
+              ["ada@example.com", 36, 9.5, true, Bytes.fromHex("504e47000a27"), Role.Admin, "it's \"quoted\" \\ ünï", "19.99", "1815-12-10", (-1 as long) as ulong])
+    db.insert("INSERT INTO gdb_users (email, age) VALUES (?, ?)", ["bob@example.com", null])
+    return db
+}
+
+test "URLs" {
+    let o = MySql.parseUrl("mysql://app:p%40ss%3Aw0rd@db.example.com:3307/shop?timeout=3")
+    assertEq("${o.user} ${o.password} ${o.host} ${o.port} ${o.database} ${o.connectTimeout}", "app p@ss:w0rd db.example.com 3307 shop 3")
+    let s = MySql.parseUrl("mariadb://root@localhost/?socket=/run/mysqld/mysqld.sock")
+    assertEq("${s.user} '${s.password}' ${s.host} ${s.port} '${s.database}' ${s.socket}", "root '' localhost 3306 '' /run/mysqld/mysqld.sock")
+    let v6 = MySql.parseUrl("mysql://[::1]:3310/x")
+    assertEq("${v6.host} ${v6.port} ${v6.toString()}", "::1 3310 mysql://::1:3310/x")
+    let bad = new Array<string>()
+    for (u in ["postgres://x/y", "mysql://h:99999/d", "mysql://h/d?colour=red"]) {
+        try { MySql.parseUrl(u) } catch (e: ValueError) { bad.push(e.message()) }
+    }
+    assertEq(Str.join(bad, "\n"),
+             "not a MySQL URL (mysql://user:password@host:port/database): postgres://x/y\n" +
+             "bad port in MySQL URL: mysql://h:99999/d\n" +
+             "unknown MySQL URL option 'colour' (socket, timeout): mysql://h/d?colour=red")
+}
+
+test "connection errors" {
+    if (!MySql.available()) { return }
+    assertEq(MySql.clientVersion() != "", true)
+    let msg = ""
+    let code = 0
+    try { MySql.open("mysql://nobody@127.0.0.1:1/none?timeout=2") } catch (e: DbError) { msg = e.message(); code = e.code }
+    assertEq(Str.startsWith(msg, "cannot connect to mysql://nobody@127.0.0.1:1/none: "), true)
+    assertEq(code == 2002 || code == 2003, true)                                    // (libmariadb, libmysqlclient)
+}
+
+test "values in and out, NULL and blobs" {
+    let db = fresh()
+    if (db == null) { return }
+    assertEq(db.driver(), "mysql")
+    assertEq(db.lastInsertId(), 2 as long)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_users") as long, 2 as long)
+    let rows = db.query("SELECT id, email, age, score, active, role, note, price, born, big, flags FROM gdb_users ORDER BY id")
+    assertEq(rows.size(), 2)
+    assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,role,note,price,born,big,flags")
+    assertEq(rows.get(0).toString(), "{id: 1, email: \"ada@example.com\", age: 36, score: 9.5, active: 1, role: 2, note: \"it's \"quoted\" \\ ünï\", " +
+                                     "price: \"19.99\", born: \"1815-12-10\", big: 18446744073709551615, flags: 5}")
+    assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, role: NULL, note: NULL, " +
+                                     "price: NULL, born: NULL, big: NULL, flags: NULL}")
+    let ada = db.queryOne("SELECT * FROM gdb_users WHERE email = ?", ["ada@example.com"])
+    assertEq("${ada.getInt("age")} ${ada.getFloat("score")} ${ada.getBool("active")} ${ada.getFloat("price")}", "36 9.5 true 19.99")
+    assertEq(ada.getBytes("avatar").toHex(), "504e47000a27")
+    assertEq(ada.getString("note"), "it's \"quoted\" \\ ünï")
+    assertEq(db.queryOne("SELECT * FROM gdb_users WHERE id = ?", [99]) == null, true)
+    assertEq(db.execute("UPDATE gdb_users SET age = age + 1 WHERE age IS NOT NULL"), 1 as long)
+    assertEq(db.execute("UPDATE gdb_users SET age = 37 WHERE id = 1"), 1 as long)     // (matched, though unchanged)
+    // Literals: each kind, and `?`s in strings, identifiers and comments left alone.
+    let s = db.queryOne("SELECT CONCAT('x?', ?) AS `a?`, ? AS b, ? AS c, ? AS d, ? AS e, ? AS f /* ? */ -- ?\n, '\\'?' AS g # ?",
+                        ["y", 2.5, false, null, -9223372036854775807 as long - 1, 0.1])
+    assertEq("${s.getString("a?")} ${s.getFloat("b")} ${s.getInt("c")} ${s.isNull("d")} ${s.getInt("e")} ${s.getFloat("f")} ${s.getString("g")}",
+             "x?y 2.5 0 true -9223372036854775808 0.1 '?")
+    assertEq(db.queryOne("SELECT ? AS b", [Bytes.fromString("")]).getBytes("b").size(), 0)
+    assertEq(db.quote("we`ird"), "`we``ird`")
+    assertEq(db.ping() && db.serverVersion() != "", true)
+    db.exec("DROP TABLE gdb_users")
+    db.close()
+}
+
+test "errors name what went wrong" {
+    let db = fresh()
+    if (db == null) { return }
+    let msgs = new Array<string>()
+    try { db.insert("INSERT INTO gdb_users (email) VALUES (?)", ["ada@example.com"]) } catch (e: DbError) { msgs.push("${e.code} " + e.message()) }
+    try { db.query("SELECT nope FROM gdb_users") } catch (e: DbError) { msgs.push("${e.code} " + e.message() + " | " + e.sql) }
+    try { db.query("SELECT * FROM gdb_users WHERE id = ?", []) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.query("SELECT ?", [new Array<int>()]) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.query("SELECT ?", [0.0 / 0.0]) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.exec("SELECT 1; SELEC 2") } catch (e: DbError) { msgs.push("${e.code}") }
+    assertEq(db.queryValue("SELECT 3") as long, 3 as long)                          // (still in step after that)
+    assertEq(Str.join(msgs, "\n"),
+             "1062 Duplicate entry 'ada@example.com' for key 'email'\n" +
+             "1054 Unknown column 'nope' in 'SELECT' | SELECT nope FROM gdb_users\n" +
+             "the SQL has 1 placeholder(s) but 0 argument(s) were given\n" +
+             "argument 1 is an object of class Array: SQL takes numbers, bools, strings, Bytes and null\n" +
+             "argument 1 is NaN or infinite: MySQL has no such numbers\n" +
+             "1064")
+    db.exec("DROP TABLE gdb_users")
+    let st = db.prepare("SELECT 1")
+    db.close()
+    let closed = 0
+    try { db.query("SELECT 1") } catch (e: StateError) { closed += 1 }
+    try { st.query([]) } catch (e: StateError) { closed += 1 }
+    assertEq(closed, 2)
+}
+
+test "transactions, savepoints and rollbacks" {
+    let db = fresh()
+    if (db == null) { return }
+    db.exec("ALTER TABLE gdb_users ENGINE = InnoDB")
+    db.transaction(fn() {
+        db.execute("UPDATE gdb_users SET age = 1")
+        let inner = false
+        try {
+            db.transaction(fn() { db.execute("UPDATE gdb_users SET age = 2"); throw new ValueError("inner") })
+        } catch (e: ValueError) { inner = true }
+        assertEq(inner, true)
+        assertEq(db.inTransaction(), true)
+    })
+    assertEq(db.queryValue("SELECT MAX(age) FROM gdb_users") as long, 1 as long)
+    let outer = false
+    try { db.transaction(fn() { db.execute("DELETE FROM gdb_users"); throw new ValueError("boom") }) } catch (e: ValueError) { outer = true }
+    assertEq(outer, true)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_users") as long, 2 as long)
+    db.exec("DROP TABLE gdb_users")
+    db.close()
+}
+
+test "statements, streaming and the cache" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_n; CREATE TABLE gdb_n (v INT, KEY (v))")
+    let st = db.prepare("INSERT INTO gdb_n (v) VALUES (?)")
+    db.transaction(fn() { for (i in 0..1000) { st.run([i]) } })
+    st.close()
+    assertEq(db.queryValue("SELECT SUM(v) FROM gdb_n") as string, "499500")      // (SUM is a DECIMAL)
+    let seen = new Array<string>()
+    db.each("SELECT v FROM gdb_n WHERE v < ? ORDER BY v", [3], fn(r: Row) {
+        let twice = db.queryValue("SELECT v * 2 FROM gdb_n WHERE v = ?", [r.get("v")]) as long
+        let again = db.query("SELECT v FROM gdb_n WHERE v < ? ORDER BY v", [2]).size()
+        seen.push("${r.getInt("v")}:${twice}:${again}")
+    })
+    assertEq(Str.join(seen, " "), "0:0:2 1:2:2 2:4:2")
+    for (i in 0..200) { assertEq(db.queryValue("SELECT v FROM gdb_n WHERE v = ?", [i]) as long, i as long) }
+    let stopped = false
+    try { db.each("SELECT v FROM gdb_n", [], fn(r: Row) { throw new ValueError("stop") }) } catch (e: ValueError) { stopped = true }
+    assertEq(stopped && db.query("SELECT v FROM gdb_n").size() == 1000, true)
+    // A CALL's extra status result is read and dropped.
+    db.exec("DROP PROCEDURE IF EXISTS gdb_p; CREATE PROCEDURE gdb_p(IN x INT) SELECT x + 1 AS y")
+    assertEq(db.queryValue("CALL gdb_p(?)", [41]) as long, 42 as long)
+    assertEq(db.queryValue("SELECT 1") as long, 1 as long)
+    db.exec("DROP PROCEDURE gdb_p; DROP TABLE gdb_n")
+    db.close()
+}
+
+test "a pool shared by threads" {
+    let first = server()
+    if (first == null) { return }
+    first.exec("DROP TABLE IF EXISTS gdb_hits; CREATE TABLE gdb_hits (worker INT, n INT)")
+    first.close()
+    let url = env("GRAV_DB_MYSQL")
+    let pool = new Pool(3, fn() -> Connection => MySql.open(url))
+    let threads = new Array<Thread>()
+    for (w in 0..6) {
+        threads.push(Thread.spawn(fn() {
+            for (i in 0..50) {
+                pool.with(fn(c: Connection) { c.execute("INSERT INTO gdb_hits (worker, n) VALUES (?, ?)", [w, i]) })
+            }
+        }))
+    }
+    for (t in threads) { t.join() }
+    assertEq(pool.opened() <= 3, true)
+    pool.with(fn(c: Connection) {
+        assertEq(c.queryValue("SELECT COUNT(*) FROM gdb_hits") as long, 300 as long)
+        c.exec("DROP TABLE gdb_hits")
+    })
+    pool.close()
+}

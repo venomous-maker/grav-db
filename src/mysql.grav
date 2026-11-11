@@ -1,0 +1,675 @@
+// mysql.grav — MySQL and MariaDB servers, using the system's client library
+// (libmariadb, or libmysqlclient).
+//
+//   let db = MySql.open("mysql://app:secret@localhost/shop")
+//   db.exec("CREATE TABLE IF NOT EXISTS notes (id INT AUTO_INCREMENT PRIMARY KEY, body TEXT)")
+//   db.insert("INSERT INTO notes (body) VALUES (?)", ["hello"])
+//   print(db.queryValue("SELECT COUNT(*) FROM notes"))
+//
+// The client library is loaded the first time a connection is made; without it,
+// MySql.available() is false and connecting throws StateError. Arguments are
+// written into the SQL as escaped literals (strings through the server's own
+// escaping, Bytes as hex), so a query is one round trip. Integer columns come
+// out as long, FLOAT and DOUBLE as float, binary strings and BLOBs as Bytes,
+// NULL as null, and everything else (DECIMAL, dates, text) as string. Each
+// query's rows are read whole before they are handed out, so a query may run
+// inside another's each().
+import "std"
+import "database.grav"
+
+namespace db {
+
+    %{
+    #include <dlfcn.h>
+    #include <limits.h>
+    #include <math.h>
+    #include <pthread.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    /* MYSQL_FIELD: the same in libmariadb and libmysqlclient. */
+    typedef struct {
+        char *name, *org_name, *table, *org_table, *db, *catalog, *def;
+        unsigned long length, max_length;
+        unsigned int name_length, org_name_length, table_length, org_table_length, db_length, catalog_length, def_length;
+        unsigned int flags, decimals, charsetnr;
+        int type;
+        void* extension;
+    } grav_my_field;
+    static struct {
+        void* (*init)(void*);
+        void* (*real_connect)(void*, const char*, const char*, const char*, const char*, unsigned int, const char*, unsigned long);
+        int (*options)(void*, int, const void*);
+        int (*real_query)(void*, const char*, unsigned long);
+        void* (*store_result)(void*);
+        char** (*fetch_row)(void*);
+        unsigned long* (*fetch_lengths)(void*);
+        grav_my_field* (*fetch_fields)(void*);
+        unsigned int (*num_fields)(void*);
+        unsigned long long (*num_rows)(void*);
+        unsigned int (*field_count)(void*);
+        unsigned long long (*affected_rows)(void*);
+        unsigned long long (*insert_id)(void*);
+        int (*next_result)(void*);
+        char (*more_results)(void*);
+        void (*free_result)(void*);
+        const char* (*error)(void*);
+        unsigned int (*errnum)(void*);
+        void (*close)(void*);
+        const char* (*get_client_info)(void);
+        const char* (*get_server_info)(void*);
+        int (*ping)(void*);
+        unsigned long (*real_escape_string)(void*, char*, const char*, unsigned long);
+        int (*library_init)(int, char**, char**);
+    } grav_my;
+    static int (*grav_my_thread_init)(void);          /* (not in every library) */
+    static int grav_my_ok = 0;
+    static pthread_once_t grav_my_once = PTHREAD_ONCE_INIT;
+
+    static void grav_my_load(void) {
+        static const char* const names[] = { "libmariadb.so.3", "libmariadb.so", "libmysqlclient.so.24", "libmysqlclient.so.21",
+                                             "libmysqlclient.so", "libmariadb.dylib", "libmysqlclient.dylib", 0 };
+        void* h = 0;
+        for (int i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) return;
+    #define GRAV_MY_FN(field, name) *(void**)(&grav_my.field) = dlsym(h, name)
+        GRAV_MY_FN(init, "mysql_init"); GRAV_MY_FN(real_connect, "mysql_real_connect");
+        GRAV_MY_FN(options, "mysql_options"); GRAV_MY_FN(real_query, "mysql_real_query");
+        GRAV_MY_FN(store_result, "mysql_store_result"); GRAV_MY_FN(fetch_row, "mysql_fetch_row");
+        GRAV_MY_FN(fetch_lengths, "mysql_fetch_lengths"); GRAV_MY_FN(fetch_fields, "mysql_fetch_fields");
+        GRAV_MY_FN(num_fields, "mysql_num_fields"); GRAV_MY_FN(num_rows, "mysql_num_rows");
+        GRAV_MY_FN(field_count, "mysql_field_count"); GRAV_MY_FN(affected_rows, "mysql_affected_rows");
+        GRAV_MY_FN(insert_id, "mysql_insert_id"); GRAV_MY_FN(next_result, "mysql_next_result");
+        GRAV_MY_FN(more_results, "mysql_more_results"); GRAV_MY_FN(free_result, "mysql_free_result");
+        GRAV_MY_FN(error, "mysql_error"); GRAV_MY_FN(errnum, "mysql_errno"); GRAV_MY_FN(close, "mysql_close");
+        GRAV_MY_FN(get_client_info, "mysql_get_client_info"); GRAV_MY_FN(get_server_info, "mysql_get_server_info");
+        GRAV_MY_FN(ping, "mysql_ping"); GRAV_MY_FN(real_escape_string, "mysql_real_escape_string");
+        GRAV_MY_FN(library_init, "mysql_library_init");
+        if (!grav_my.library_init) GRAV_MY_FN(library_init, "mysql_server_init");   /* (libmariadb's name) */
+    #undef GRAV_MY_FN
+        *(void**)(&grav_my_thread_init) = dlsym(h, "mysql_thread_init");
+        void** all = (void**)&grav_my;
+        for (size_t i = 0; i < sizeof grav_my / sizeof(void*); i++) if (!all[i]) return;
+        grav_my_ok = grav_my.library_init(0, 0, 0) == 0;
+    }
+    static int grav_my_ready(void) {
+        pthread_once(&grav_my_once, grav_my_load);
+        if (grav_my_ok && grav_my_thread_init) grav_my_thread_init();   /* (once per thread is enough; more is harmless) */
+        return grav_my_ok;
+    }
+    static const char* grav_my_copy(const char* s, long n) {
+        if (!s) s = "";
+        if (n < 0) n = (long)strlen(s);
+        char* out = grav_str_alloc((size_t)n + 1);
+        if (!out) abort();
+        memcpy(out, s, (size_t)n);
+        out[n] = 0;
+        return out;
+    }
+    static int grav_my_hex(int c) {
+        return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+    }
+    /* %XX escapes in a URL's user, password or database name. */
+    static const char* grav_my_unescape(const char* s) {
+        size_t n = strlen(s), o = 0;
+        char* out = grav_str_alloc(n + 1);
+        if (!out) abort();
+        for (size_t i = 0; i < n; i++) {
+            int hi = i + 2 < n + 1 ? grav_my_hex(s[i + 1]) : -1, lo = hi >= 0 ? grav_my_hex(s[i + 2]) : -1;
+            if (s[i] == '%' && lo >= 0) { out[o++] = (char)(hi * 16 + lo); i += 2; }
+            else out[o++] = s[i];
+        }
+        out[o] = 0;
+        return out;
+    }
+
+    /* A connection shared by its MySqlConnection and the statements made from it:
+       closed (m = 0) by the connection, freed when the last of them lets go. */
+    typedef struct { void* m; int refs; } grav_my_conn;
+    static grav_my_conn* grav_my_conn_new(void* m) {
+        grav_my_conn* c = (grav_my_conn*)malloc(sizeof *c);
+        if (!c) abort();
+        c->m = m; c->refs = 1;
+        return c;
+    }
+    static void grav_my_conn_close(grav_my_conn* c) { if (c->m) { grav_my.close(c->m); c->m = 0; } }
+    static void grav_my_conn_unref(grav_my_conn* c) {
+        if (__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL) == 0) { grav_my_conn_close(c); free(c); }
+    }
+    /* Reads and drops the results after the first one (a CALL's status, a
+       multi-statement's rest): 0, or the error number of the one that failed. */
+    static unsigned int grav_my_drain(void* m) {
+        while (grav_my.more_results(m)) {
+            int rc = grav_my.next_result(m);
+            if (rc > 0) return grav_my.errnum(m);
+            if (rc < 0) break;
+            void* r = grav_my.store_result(m);
+            if (r) grav_my.free_result(r);
+            else if (grav_my.field_count(m) > 0) return grav_my.errnum(m);
+        }
+        return 0;
+    }
+
+    /* A statement: its SQL, where its `?`s are, and the buffer its runs are
+       written into (the SQL with each `?` replaced by its argument's literal). */
+    typedef struct {
+        grav_my_conn* c;
+        const char* sql;
+        size_t sqllen, from, len, cap;
+        int n;
+        int* pos;
+        char* buf;
+    } grav_my_stmt;
+    /* The offsets of the `?` placeholders in sql[0..n), skipping quoted strings
+       and identifiers and comments. */
+    static int grav_my_scan(const char* s, size_t n, int** out) {
+        int k = 0, cap = 0;
+        int* pos = 0;
+        for (size_t i = 0; i < n; i++) {
+            char ch = s[i];
+            if (ch == '\'' || ch == '"' || ch == '`') {
+                for (i++; i < n; i++) {
+                    if (s[i] == '\\' && ch != '`') { i++; continue; }
+                    if (s[i] == ch) { if (i + 1 < n && s[i + 1] == ch) { i++; continue; } break; }
+                }
+            } else if (ch == '#' || (ch == '-' && i + 2 < n && s[i + 1] == '-' && (s[i + 2] == ' ' || s[i + 2] == '\t' || s[i + 2] == '\n' || s[i + 2] == '\r'))) {
+                while (i < n && s[i] != '\n') i++;
+            } else if (ch == '/' && i + 1 < n && s[i + 1] == '*') {
+                for (i += 2; i + 1 < n && !(s[i] == '*' && s[i + 1] == '/'); i++) {}
+                i++;
+            } else if (ch == '?') {
+                if (k == cap) { cap = cap ? cap * 2 : 8; pos = (int*)realloc(pos, (size_t)cap * sizeof(int)); if (!pos) abort(); }
+                pos[k++] = (int)i;
+            }
+        }
+        *out = pos;
+        return k;
+    }
+    static grav_my_stmt* grav_my_stmt_new(grav_my_conn* c, const char* sql) {
+        grav_my_stmt* h = (grav_my_stmt*)calloc(1, sizeof *h);
+        if (!h) abort();
+        __atomic_add_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
+        h->c = c;
+        h->sql = sql;
+        h->sqllen = grav_str_len(sql);
+        h->n = grav_my_scan(sql, h->sqllen, &h->pos);
+        return h;
+    }
+    static void grav_my_stmt_free(grav_my_stmt* h) { grav_my_conn_unref(h->c); free(h->pos); free(h->buf); free(h); }
+    static void grav_my_reserve(grav_my_stmt* h, size_t n) {   /* room for n more bytes */
+        if (h->len + n <= h->cap) return;
+        size_t c = h->cap ? h->cap * 2 : 256;
+        while (c < h->len + n) c *= 2;
+        char* b = (char*)realloc(h->buf, c);
+        if (!b) abort();
+        h->buf = b; h->cap = c;
+    }
+    static void grav_my_put(grav_my_stmt* h, const char* p, size_t n) {
+        grav_my_reserve(h, n);
+        memcpy(h->buf + h->len, p, n);
+        h->len += n;
+    }
+    /* Copies the SQL up to placeholder i (the end, for i = n). */
+    static void grav_my_seg(grav_my_stmt* h, int i) {
+        size_t to = i < h->n ? (size_t)h->pos[i] : h->sqllen;
+        grav_my_put(h, h->sql + h->from, to - h->from);
+        h->from = to + 1;
+    }
+    /* Writes argument i as a literal: 0 done, -1 for a kind it cannot take, -2
+       for a float that is NaN or infinite. */
+    static int grav_my_arg(grav_my_stmt* h, int i, GravAny v) {
+        char tmp[48];
+        int k = 0;
+        switch (v.tag) {
+            case GRAV_ANY_NULL: grav_my_seg(h, i); grav_my_put(h, "NULL", 4); return 0;
+            case GRAV_ANY_INT: case GRAV_ANY_ENUM: k = snprintf(tmp, sizeof tmp, "%lld", (long long)v.v.i); break;
+            case GRAV_ANY_UINT: k = snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)v.v.u); break;
+            case GRAV_ANY_BOOL: tmp[0] = v.v.b ? '1' : '0'; k = 1; break;
+            case GRAV_ANY_FLOAT: {
+                double d = v.v.f;
+                if (!isfinite(d)) return -2;
+                for (int p = 15; p <= 17; p++) { k = snprintf(tmp, sizeof tmp, "%.*g", p, d); if (strtod(tmp, 0) == d) break; }
+                if (!strpbrk(tmp, "eEni")) { memcpy(tmp + k, "e0", 3); k += 2; }   /* (a DOUBLE literal, not a DECIMAL one) */
+                break;
+            }
+            case GRAV_ANY_STR: {
+                size_t n = grav_str_len(v.v.s);
+                grav_my_seg(h, i);
+                grav_my_put(h, "'", 1);
+                grav_my_reserve(h, 2 * n + 2);
+                h->len += grav_my.real_escape_string(h->c->m, h->buf + h->len, v.v.s, (unsigned long)n);
+                grav_my_put(h, "'", 1);
+                return 0;
+            }
+            default: return -1;
+        }
+        grav_my_seg(h, i);
+        grav_my_put(h, tmp, (size_t)k);
+        return 0;
+    }
+    static void grav_my_blob(grav_my_stmt* h, int i, const unsigned char* p, size_t n) {
+        static const char hex[] = "0123456789ABCDEF";
+        grav_my_seg(h, i);
+        grav_my_put(h, "X'", 2);
+        grav_my_reserve(h, 2 * n + 1);
+        char* o = h->buf + h->len;
+        for (size_t j = 0; j < n; j++) { *o++ = hex[p[j] >> 4]; *o++ = hex[p[j] & 15]; }
+        *o++ = '\'';
+        h->len = (size_t)(o - h->buf);
+    }
+    /* Sends the statement (with the arguments written since the last send). */
+    static int grav_my_send(grav_my_stmt* h) {
+        int rc;
+        if (h->n == 0) rc = grav_my.real_query(h->c->m, h->sql, (unsigned long)h->sqllen);
+        else { grav_my_seg(h, h->n); rc = grav_my.real_query(h->c->m, h->buf, (unsigned long)h->len); }
+        h->len = 0; h->from = 0;
+        if (h->cap > (1u << 20)) { free(h->buf); h->buf = 0; h->cap = 0; }   /* (a big blob's buffer is not kept) */
+        return rc;
+    }
+
+    static int grav_my_is_binary(const grav_my_field* f) {
+        return f->charsetnr == 63 && ((f->type >= 249 && f->type <= 255) || f->type == 15);
+    }
+    /* Writes a row's n values to out[0..n). A binary string is left null and
+       counted: the caller makes its Bytes. Returns how many there were. */
+    static int grav_my_fill(const grav_my_field* f, int n, char** row, const unsigned long* lens, GravAny* out) {
+        int bins = 0;
+        for (int i = 0; i < n; i++) {
+            GravAny a;
+            memset(&a, 0, sizeof a);
+            const char* p = row[i];
+            if (p) switch (f[i].type) {
+                case 1: case 2: case 3: case 8: case 9: case 13: {
+                    if (f[i].type == 8 && (f[i].flags & 32) && lens[i] >= 19) {      /* BIGINT UNSIGNED */
+                        unsigned long long u = strtoull(p, 0, 10);
+                        if (u > (unsigned long long)LLONG_MAX) { a.tag = GRAV_ANY_UINT; a.v.u = u; break; }
+                    }
+                    long long x = 0;
+                    int neg = *p == '-';
+                    for (const char* q = p + neg; *q >= '0' && *q <= '9'; q++) x = x * 10 + (*q - '0');
+                    a.tag = GRAV_ANY_INT; a.v.i = neg ? -x : x;
+                    break;
+                }
+                case 4: case 5: a.tag = GRAV_ANY_FLOAT; a.v.f = strtod(p, 0); break;
+                case 16: {                                                           /* BIT(n): big-endian bytes */
+                    unsigned long long x = 0;
+                    for (unsigned long j = 0; j < lens[i] && j < 8; j++) x = (x << 8) | (unsigned char)p[j];
+                    a.tag = GRAV_ANY_INT; a.v.i = (long long)x;
+                    break;
+                }
+                case 6: break;
+                default:
+                    if (grav_my_is_binary(&f[i])) { bins++; break; }
+                    a.tag = GRAV_ANY_STR;
+                    a.v.s = grav_my_copy(p, (long)lens[i]);
+            }
+            out[i] = a;
+        }
+        return bins;
+    }
+    %}
+
+    // Where and how to connect: MySql.connect takes these (MySql.open, a URL).
+    class MySqlOptions {
+        // The server: "localhost" (the default) is the local Unix socket.
+        public host: string
+        public port: int
+        // The account: "" is your login name.
+        public user: string
+        public password: string
+        // The database the connection starts in ("" : none, until a USE).
+        public database: string
+        // The Unix socket for "localhost" ("" : the client library's default).
+        public socket: string
+        // Seconds to wait for the server to answer (0 : the library's default).
+        public connectTimeout: int
+
+        constructor() {
+            self.host = "localhost";
+            self.port = 3306;
+            self.user = "";
+            self.password = "";
+            self.database = "";
+            self.socket = "";
+            self.connectTimeout = 10;
+        }
+        fn toString() -> string {
+            let at = self.host == "localhost" && self.socket != "" ? self.socket : "${self.host}:${self.port}";
+            return "mysql://" + (self.user == "" ? "" : self.user + "@") + at + "/" + self.database;
+        }
+    }
+
+    // Connecting to MySQL and MariaDB servers.
+    class MySql {
+        // Whether a MySQL or MariaDB client library could be loaded.
+        static fn available() -> bool { return %{ grav_my_ready() %} as bool; }
+        // The client library's version ("3.4.8").
+        static fn clientVersion() -> string {
+            MySql.need();
+            return %{ grav_my_copy(grav_my.get_client_info(), -1) %} as string;
+        }
+        // Connects to the server a URL names: "mysql://user:password@host:3306/database"
+        // ("mariadb://" too), with optional ?socket=/path/to/mysqld.sock and
+        // ?timeout=seconds. Escape any of :@/?# in the password as %XX.
+        static fn open(url: string) -> MySqlConnection { return MySql.connect(MySql.parseUrl(url)); }
+        // Connects with `o`, in utf8mb4.
+        static fn connect(o: MySqlOptions) -> MySqlConnection {
+            MySql.need();
+            let host = o.host;
+            let user = o.user;
+            let password = o.password;
+            let database = o.database;
+            let socket = o.socket;
+            let port = o.port;
+            let timeout = o.connectTimeout;
+            let m = %{ grav_my.init(0) %} as byte*;
+            if (m == null) { throw new DbError("out of memory", 0, ""); }
+            %{
+                unsigned int t = (unsigned int)timeout, off = 0;
+                grav_my.options(m, 7 /* MYSQL_SET_CHARSET_NAME */, "utf8mb4");
+                grav_my.options(m, 8 /* MYSQL_OPT_LOCAL_INFILE */, &off);
+                if (t > 0) grav_my.options(m, 0 /* MYSQL_OPT_CONNECT_TIMEOUT */, &t);
+            %};
+            let ok = %{ grav_my.real_connect(m, host, *user ? user : 0, password, *database ? database : 0, (unsigned int)port,
+                                             *socket ? socket : 0, 2 | 65536 | 131072 /* FOUND_ROWS, MULTI_STATEMENTS, MULTI_RESULTS */) != 0 %} as bool;
+            if (!ok) {
+                let why = %{ grav_my_copy(grav_my.error(m), -1) %} as string;
+                let code = %{ (int)grav_my.errnum(m) %} as int;
+                %{ grav_my.close(m); %};
+                throw new DbError("cannot connect to " + o.toString() + ": " + why, code, "");
+            }
+            return new MySqlConnection(%{ grav_my_conn_new(m) %} as byte*, o.toString());
+        }
+        // The options a URL gives (see open).
+        static fn parseUrl(url: string) -> MySqlOptions {
+            let sep = Str.indexOf(url, "://");
+            let scheme = sep < 0 ? "" : Str.lower(url[..sep]);
+            if (scheme != "mysql" && scheme != "mariadb") {
+                throw new ValueError("not a MySQL URL (mysql://user:password@host:port/database): " + url);
+            }
+            let o = new MySqlOptions();
+            let rest = url[sep + 3..];
+            let q = Str.indexOf(rest, "?");
+            let query = "";
+            if (q >= 0) { query = rest[q + 1..]; rest = rest[..q]; }
+            let slash = Str.indexOf(rest, "/");
+            let authority = slash >= 0 ? rest[..slash] : rest;
+            if (slash >= 0) { o.database = MySql.unescape(rest[slash + 1..]); }
+            let at = Str.lastIndexOf(authority, "@");
+            if (at >= 0) {
+                let info = authority[..at];
+                authority = authority[at + 1..];
+                let colon = Str.indexOf(info, ":");
+                o.user = MySql.unescape(colon >= 0 ? info[..colon] : info);
+                if (colon >= 0) { o.password = MySql.unescape(info[colon + 1..]); }
+            }
+            let close = Str.lastIndexOf(authority, "]");
+            let colon = Str.lastIndexOf(authority, ":");
+            if (colon > close) {
+                let port = Format.toIntOr(authority[colon + 1..], -1);
+                if (port <= 0 || port > 65535) { throw new ValueError("bad port in MySQL URL: " + url); }
+                o.port = port;
+                authority = authority[..colon];
+            }
+            if (Str.startsWith(authority, "[") && Str.endsWith(authority, "]")) { authority = authority[1..authority.length - 1]; }
+            if (authority != "") { o.host = authority; }
+            for (pair in Str.split(query, "&")) {
+                if (pair == "") { continue; }
+                let eq = Str.indexOf(pair, "=");
+                let key = eq >= 0 ? pair[..eq] : pair;
+                let value = eq >= 0 ? MySql.unescape(pair[eq + 1..]) : "";
+                switch (key) {
+                    case "socket": o.socket = value
+                    case "timeout": o.connectTimeout = Format.toIntOr(value, o.connectTimeout)
+                    default: throw new ValueError("unknown MySQL URL option '" + key + "' (socket, timeout): " + url)
+                }
+            }
+            return o;
+        }
+        private static fn unescape(s: string) -> string { return %{ grav_my_unescape(s) %} as string; }
+        private static fn need() {
+            if (!MySql.available()) { throw new StateError("MySQL is not available: no libmariadb or libmysqlclient could be loaded"); }
+        }
+    }
+
+    // A connection to a MySQL or MariaDB server (see Connection for what it can do).
+    class MySqlConnection extends Connection {
+        private c: byte*                         // grav_my_conn*
+        private cache: HashMap<string, MySqlStatement>
+        private openFlag: bool
+        // Where it is connected ("mysql://app@localhost:3306/shop").
+        public url: string
+
+        constructor(c: byte*, url: string) {
+            super();
+            self.c = c;
+            self.url = url;
+            self.cache = new HashMap<string, MySqlStatement>();
+            self.openFlag = true;
+        }
+        destructor() {
+            self.close();
+            let c = self.c;
+            %{ grav_my_conn_unref((grav_my_conn*)c); %};
+        }
+
+        // A new statement for `sql` (yours to run and close).
+        fn prepare(sql: string) -> Statement { return self.make(sql); }
+        fn exec(sql: string) {
+            let m = self.handle();
+            let code = %{ grav_my.real_query(m, sql, (unsigned long)grav_str_len(sql)) ? grav_my.errnum(m) : 0 %} as int;
+            if (code == 0) {
+                code = %{ ({ void* r = grav_my.store_result(m);
+                             unsigned int e = !r && grav_my.field_count(m) > 0 ? grav_my.errnum(m) : 0;
+                             if (r) grav_my.free_result(r);
+                             e ? e : grav_my_drain(m); }) %} as int;
+            }
+            if (code != 0) { throw self.error(sql); }
+        }
+        fn lastInsertId() -> long { let m = self.handle(); return %{ (long long)grav_my.insert_id(m) %} as long; }
+        // Rows the last INSERT, UPDATE or DELETE matched.
+        fn changes() -> long { let m = self.handle(); return %{ (long long)grav_my.affected_rows(m) %} as long; }
+        // The server's version ("11.8.3-MariaDB").
+        fn serverVersion() -> string { let m = self.handle(); return %{ grav_my_copy(grav_my.get_server_info(m), -1) %} as string; }
+        // Whether the server still answers (a connection idle for long may have been dropped).
+        fn ping() -> bool { let m = self.handle(); return %{ grav_my.ping(m) == 0 %} as bool; }
+        fn isOpen() -> bool { return self.openFlag; }
+        fn driver() -> string { return "mysql"; }
+        // `name` as a quoted identifier: `name`.
+        fn quote(name: string) -> string { return "`" + Str.replace(name, "`", "``") + "`"; }
+        fn close() {
+            if (!self.openFlag) { return; }
+            self.openFlag = false;
+            for (st in self.cache.values()) { st.close(); }
+            self.cache.clear();
+            let c = self.c;
+            %{ grav_my_conn_close((grav_my_conn*)c); %};
+        }
+
+        // The cached statement for `sql` (a statement is safe to run again inside
+        // its own each(): its rows are read before they are handed out).
+        protected fn borrow(sql: string) -> Statement {
+            let st = self.cache.getOr(sql, null);
+            if (st == null) {
+                if (self.cache.size() >= 256) { self.cache.clear(); }   // (one still running keeps working)
+                st = self.make(sql);
+                self.cache.put(sql, st);
+            }
+            return st;
+        }
+        protected fn done(st: Statement) {}
+        protected fn beginSql() -> string { return "START TRANSACTION"; }
+
+        private fn make(sql: string) -> MySqlStatement {
+            self.handle();
+            let c = self.c;
+            return new MySqlStatement(sql, %{ grav_my_stmt_new((grav_my_conn*)c, sql) %} as byte*);
+        }
+        private fn error(sql: string) -> DbError {
+            let m = self.handle();
+            return new DbError(%{ grav_my_copy(grav_my.error(m), -1) %} as string, %{ (int)grav_my.errnum(m) %} as int, sql);
+        }
+        private fn handle() -> byte* {
+            if (!self.openFlag) { throw new StateError("the MySQL connection to " + self.url + " is closed"); }
+            let c = self.c;
+            return %{ ((grav_my_conn*)c)->m %} as byte*;
+        }
+    }
+
+    // A MySQL statement (see Statement): its SQL with the `?`s found, run with
+    // the arguments written in.
+    class MySqlStatement extends Statement {
+        private h: byte*                          // grav_my_stmt*
+        private cols: Columns                     // the result's columns, made on the first run
+        private closed: bool
+
+        constructor(sql: string, h: byte*) {
+            super(sql);
+            self.h = h;
+            self.cols = null;
+            self.closed = false;
+        }
+        destructor() {
+            let h = self.h;
+            %{ grav_my_stmt_free((grav_my_stmt*)h); %};
+        }
+
+        fn run(args: Array<any>) -> long {
+            let m = self.send(args);
+            let n = %{ ({ void* r = grav_my.store_result(m);
+                          long long k = !r && grav_my.field_count(m) > 0 ? -1 : (long long)grav_my.affected_rows(m);
+                          if (r) grav_my.free_result(r); k; }) %} as long;
+            if (n < 0) { throw self.error(m); }
+            self.drain(m);
+            return n;
+        }
+        fn query(args: Array<any>) -> ResultSet {
+            let m = self.send(args);
+            let r = self.result(m);
+            if (r == null) { return new ResultSet(new Columns(new Array<string>()), new Array<any>(), 0); }
+            let cols = self.columns(r);
+            let n = cols.size();
+            let rows = %{ (int)grav_my.num_rows(r) %} as int;
+            let vals = new Array<any>(rows * n);
+            let f = %{ grav_my.fetch_fields(r) %} as byte*;
+            let count = 0;
+            let row = %{ grav_my.fetch_row(r) %} as byte*;
+            while (row != null) {
+                self.fill(vals, n, f, row, %{ grav_my.fetch_lengths(r) %} as byte*);
+                count += 1;
+                row = %{ grav_my.fetch_row(r) %} as byte*;
+            }
+            %{ grav_my.free_result(r); %};
+            return new ResultSet(cols, vals, count);
+        }
+        fn queryOne(args: Array<any>) -> Row {
+            let m = self.send(args);
+            let r = self.result(m);
+            if (r == null) { return null; }
+            let row = %{ grav_my.fetch_row(r) %} as byte*;
+            if (row == null) { %{ grav_my.free_result(r); %}; return null; }
+            let cols = self.columns(r);
+            let vals = new Array<any>(cols.size());
+            self.fill(vals, cols.size(), %{ grav_my.fetch_fields(r) %} as byte*, row, %{ grav_my.fetch_lengths(r) %} as byte*);
+            %{ grav_my.free_result(r); %};
+            return new Row(cols, vals, 0);
+        }
+        fn each(args: Array<any>, f: fn(Row)) {
+            let m = self.send(args);
+            let r = self.result(m);
+            if (r == null) { return; }
+            let cols = self.columns(r);
+            let n = cols.size();
+            let fields = %{ grav_my.fetch_fields(r) %} as byte*;
+            let row = %{ grav_my.fetch_row(r) %} as byte*;
+            while (row != null) {
+                let vals = new Array<any>(n);              // (each row its own: one kept past the call stays right)
+                self.fill(vals, n, fields, row, %{ grav_my.fetch_lengths(r) %} as byte*);
+                try { f(new Row(cols, vals, 0)); } catch (e: Exception) { %{ grav_my.free_result(r); %}; throw e; }
+                row = %{ grav_my.fetch_row(r) %} as byte*;
+            }
+            %{ grav_my.free_result(r); %};
+        }
+        fn close() { self.closed = true; }
+
+        // Writes `args` into the SQL (their count must match the `?`s) and sends
+        // it; the connection's MYSQL*.
+        private fn send(args: Array<any>) -> byte* {
+            if (self.closed) { throw new StateError("the statement is closed: " + self.sql); }
+            let h = self.h;
+            let m = %{ ((grav_my_stmt*)h)->c->m %} as byte*;
+            if (m == null) { throw new StateError("the statement's MySQL connection is closed: " + self.sql); }
+            let want = %{ ((grav_my_stmt*)h)->n %} as int;
+            if (args.size() != want) {
+                throw new DbError("the SQL has ${want} placeholder(s) but ${args.size()} argument(s) were given", 0, self.sql);
+            }
+            for (i, a in args) {
+                let rc = %{ grav_my_arg((grav_my_stmt*)h, i, a) %} as int;   // scalars in one call
+                if (rc == -1 && a is Bytes) {
+                    let b = a as Bytes;
+                    let p = b.rawData();
+                    let n = b.size();
+                    %{ grav_my_blob((grav_my_stmt*)h, i, (const unsigned char*)p, (size_t)n); %};
+                    rc = 0;
+                }
+                if (rc != 0) {
+                    %{ ((grav_my_stmt*)h)->len = 0; ((grav_my_stmt*)h)->from = 0; %};
+                    let k = i + 1;
+                    if (rc == -2) { throw new DbError("argument ${k} is NaN or infinite: MySQL has no such numbers", 0, self.sql); }
+                    let t = typename(a);                        // "std.collections.Array$int" -> "Array"
+                    let dot = Str.lastIndexOf(t, ".");
+                    if (dot >= 0) { t = t[dot + 1..]; }
+                    let gen = Str.indexOf(t, "$");
+                    if (gen > 0) { t = t[..gen]; }
+                    throw new DbError("argument ${k} is " + (a is fn() ? "a function" : "an object of class " + t) +
+                                      ": SQL takes numbers, bools, strings, Bytes and null", 0, self.sql);
+                }
+            }
+            if (%{ grav_my_send((grav_my_stmt*)h) %} as int != 0) { throw self.error(m); }
+            return m;
+        }
+        // The first result's rows (all read), or null when the statement has none;
+        // later results are dropped.
+        private fn result(m: byte*) -> byte* {
+            let r = %{ grav_my.store_result(m) %} as byte*;
+            if (r == null && %{ grav_my.field_count(m) %} as int > 0) { throw self.error(m); }
+            if (%{ grav_my.more_results(m) %} as bool) {
+                if (%{ grav_my_drain(m) %} as int != 0) {
+                    let e = self.error(m);
+                    if (r != null) { %{ grav_my.free_result(r); %}; }
+                    throw e;
+                }
+            }
+            return r;
+        }
+        private fn drain(m: byte*) { if (%{ grav_my_drain(m) %} as int != 0) { throw self.error(m); } }
+        private fn error(m: byte*) -> DbError {
+            return new DbError(%{ grav_my_copy(grav_my.error(m), -1) %} as string, %{ (int)grav_my.errnum(m) %} as int, self.sql);
+        }
+        private fn columns(r: byte*) -> Columns {
+            let n = %{ (int)grav_my.num_fields(r) %} as int;
+            let f = %{ grav_my.fetch_fields(r) %} as byte*;
+            if (self.cols == null || self.cols.names.size() != n) {
+                let names = new Array<string>(n);
+                for (i in 0..n) { names.push(%{ grav_my_copy(((grav_my_field*)f)[i].name, ((grav_my_field*)f)[i].name_length) %} as string); }
+                self.cols = new Columns(names);
+            }
+            return self.cols;
+        }
+        // Appends a row's n values to `vals` (filled in C; binary strings become Bytes here).
+        private fn fill(vals: Array<any>, n: int, f: byte*, row: byte*, lens: byte*) {
+            let at = vals.size();
+            vals.reserve(at + n);
+            let bins = %{ grav_my_fill((grav_my_field*)f, n, (char**)row, (unsigned long*)lens, (GravAny*)vals->data + vals->len) %} as int;
+            %{ vals->len += n; %};
+            if (bins == 0) { return; }
+            for (i in 0..n) {
+                if (%{ ((char**)row)[i] == 0 || !grav_my_is_binary(&((grav_my_field*)f)[i]) %} as bool) { continue; }
+                let b = new Bytes();
+                let len = %{ (int)((unsigned long*)lens)[i] %} as int;
+                if (len > 0) { b.appendRaw(%{ (unsigned char*)((char**)row)[i] %} as byte*, len); }
+                vals.set(at + i, b);
+            }
+        }
+    }
+}
