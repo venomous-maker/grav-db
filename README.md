@@ -115,3 +115,7 @@ grav test tests/sqlite.grav
 They cover values in and out, NULLs and blobs, errors, transactions and
 savepoints, the statement cache, streaming, a pool shared by threads on a file,
 and rows into objects through reflection.
+
+## License
+
+MIT: see [LICENSE](LICENSE).
