@@ -238,3 +238,12 @@ test "numeric as Decimal, json and jsonb as JsonValue" {
     db.exec("DROP TABLE gdb_d")
     db.close()
 }
+
+test "executeMany sends simple INSERTs as multi-row ones" {
+    assertEq(Postgres.valuesTuple("INSERT INTO t (a, b) VALUES (?, ?)"), "(?, ?)")
+    assertEq(Postgres.valuesTuple("insert into t (a) values (?)  "), "(?)")
+    assertEq(Postgres.valuesTuple("INSERT INTO t (a, b) VALUES (?, now())"), "")             // (not only ?s)
+    assertEq(Postgres.valuesTuple("INSERT INTO t (a) VALUES (?) ON CONFLICT DO NOTHING"), "")
+    assertEq(Postgres.valuesTuple("INSERT INTO t (a) SELECT ? WHERE ? > 0"), "")
+    assertEq(Postgres.valuesTuple("UPDATE t SET a = ? WHERE b = ?"), "")
+}

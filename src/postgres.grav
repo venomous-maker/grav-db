@@ -412,6 +412,23 @@ namespace db {
 
     // Connecting to PostgreSQL servers.
     class Postgres {
+        // The `(?, ?, ...)` tuple of an `INSERT ... VALUES (?, ?, ...)` that ends
+        // there and has no other `?`, or "" (executeMany sends those multi-row).
+        static fn valuesTuple(sql: string) -> string {
+            let t = Str.trimEnd(sql);
+            if (Str.endsWith(t, ";")) { return ""; }
+            if (!Str.startsWith(Str.lower(Str.trimStart(t)), "insert")) { return ""; }
+            let v = Str.lastIndexOf(Str.lower(t), "values");
+            if (v < 0) { return ""; }
+            let tuple = Str.trim(Str.slice(t, v + 6, Str.length(t)));
+            if (!Str.startsWith(tuple, "(") || !Str.endsWith(tuple, ")")) { return ""; }
+            let inner = Str.slice(tuple, 1, Str.length(tuple) - 1);
+            let marks = Str.count(inner, "?");
+            if (marks == 0 || Str.count(t, "?") != marks) { return ""; }
+            if (Str.replace(Str.replace(Str.replace(inner, "?", ""), ",", ""), " ", "") != "") { return ""; }
+            return tuple;
+        }
+
         // Whether libpq could be loaded.
         static fn available() -> bool { return %{ grav_pg_ready() %} as bool; }
         // libpq's version, as PostgreSQL numbers them (180001 for 18.1).
@@ -543,10 +560,29 @@ namespace db {
             return st;
         }
         protected fn done(st: Statement) {}
-        // Pipelines the rows: sent without waiting for each one's answer.
+        // An INSERT whose `?`s are one tuple after VALUES goes as multi-row
+        // INSERTs (up to 1000 rows each); other statements are pipelined: sent
+        // without waiting for each one's answer.
         protected fn batch(sql: string, rows: Array<Array<any>>) -> long {
+            let tuple = rows.size() > 1 ? Postgres.valuesTuple(sql) : "";
+            if (tuple != "") { return self.multiRow(sql, tuple, rows); }
             if (!(%{ grav_pg_piped %} as bool)) { return super.batch(sql, rows); }
             return (self.borrow(sql) as PostgresStatement).many(rows);
+        }
+        private fn multiRow(sql: string, tuple: string, rows: Array<Array<any>>) -> long {
+            let width = rows[0].size();
+            let per = width == 0 ? 1000 : Math.min(1000, 65535 / width);
+            let head = Str.trimEnd(Str.slice(sql, 0, Str.lastIndexOf(sql, tuple)));
+            let total = 0 as long;
+            let at = 0;
+            while (at < rows.size()) {
+                let n = Math.min(per, rows.size() - at);
+                let args = new Array<any>(n * width);
+                for (i in at..(at + n)) { for (v in rows[i]) { args.push(v); } }
+                total += self.borrow(head + " " + tuple + Str.repeat(", " + tuple, n - 1)).run(args);
+                at += n;
+            }
+            return total;
         }
 
         private fn make(sql: string) -> PostgresStatement {
