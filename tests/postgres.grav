@@ -1,0 +1,204 @@
+// PostgreSQL through grav-db. Connection errors need no server; the rest runs
+// against the one GRAV_DB_POSTGRES names, as a URL
+// ("postgresql://user:password@localhost/grav_test"), and is skipped without it.
+// It creates and drops its own tables (gdb_*) in that database.
+import "std"
+import "../src/db.grav"
+use db.*
+
+enum Role { Guest, Member, Admin }
+
+fn server() -> PostgresConnection {
+    let url = env("GRAV_DB_POSTGRES")
+    if (url == "" || !Postgres.available()) { return null }
+    return Postgres.open(url)
+}
+
+fn fresh() -> PostgresConnection {
+    let db = server()
+    if (db == null) { return null }
+    db.exec("DROP TABLE IF EXISTS gdb_users; " +
+            "CREATE TABLE gdb_users (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, age INT, score DOUBLE PRECISION, " +
+            "active BOOLEAN, avatar BYTEA, role SMALLINT, note TEXT, price NUMERIC(10,2), born DATE, tags TEXT[], meta JSONB)")
+    db.insert("INSERT INTO gdb_users (email, age, score, active, avatar, role, note, price, born, tags, meta) " +
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              ["ada@example.com", 36, 9.5, true, Bytes.fromHex("504e47000a27"), Role.Admin, "it's \"quoted\" \\ ünï", "19.99",
+               "1815-12-10", "{math,engines}", "{\"lang\": \"grav\"}"])
+    db.insert("INSERT INTO gdb_users (email, age) VALUES (?, ?)", ["bob@example.com", null])
+    return db
+}
+
+test "connection errors" {
+    if (!Postgres.available()) { return }
+    assertEq(Postgres.libVersion() > 100000, true)
+    let msg = ""
+    try { Postgres.open("postgresql://nobody@127.0.0.1:1/none?connect_timeout=2") } catch (e: DbError) { msg = e.message() }
+    assertEq(Str.startsWith(msg, "cannot connect to PostgreSQL: "), true)
+    assertEq(Str.contains(msg, "127.0.0.1"), true)
+}
+
+test "values in and out, NULL and bytea" {
+    let db = fresh()
+    if (db == null) { return }
+    assertEq(db.driver(), "postgres")
+    assertEq(db.lastInsertId(), 2 as long)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_users") as long, 2 as long)
+    let rows = db.query("SELECT id, email, age, score, active, role, note, price, born, tags, meta FROM gdb_users ORDER BY id")
+    assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,role,note,price,born,tags,meta")
+    assertEq(rows.get(0).toString(), "{id: 1, email: \"ada@example.com\", age: 36, score: 9.5, active: true, role: 2, " +
+                                     "note: \"it's \"quoted\" \\ ünï\", price: \"19.99\", born: \"1815-12-10\", " +
+                                     "tags: \"{math,engines}\", meta: \"{\"lang\": \"grav\"}\"}")
+    assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, role: NULL, " +
+                                     "note: NULL, price: NULL, born: NULL, tags: NULL, meta: NULL}")
+    let ada = db.queryOne("SELECT * FROM gdb_users WHERE email = ?", ["ada@example.com"])
+    assertEq("${ada.getInt("age")} ${ada.getFloat("score")} ${ada.getBool("active")} ${ada.getFloat("price")}", "36 9.5 true 19.99")
+    assertEq(ada.getBytes("avatar").toHex(), "504e47000a27")
+    assertEq(db.queryOne("SELECT * FROM gdb_users WHERE id = ?", [99]) == null, true)
+    assertEq(db.execute("UPDATE gdb_users SET age = age + 1 WHERE age IS NOT NULL"), 1 as long)
+    assertEq(db.changes(), 1 as long)
+    // RETURNING gives insert() the id in one round trip; $n placeholders work too.
+    assertEq(db.insert("INSERT INTO gdb_users (email) VALUES ($1) RETURNING id", ["cy@example.com"]), 3 as long)
+    // `?`s in strings, quoted names, dollar quotes and comments are left alone; `??` is a `?`.
+    let s = db.queryOne("SELECT ? || '?' AS \"a?\", ?::float8 AS b, ?::bool AS c, ? IS NULL AS d, ?::int8 AS e, " +
+                        "$$it's ?$$ AS f, '{\"k\":1}'::jsonb ?? 'k' AS g /* ? */ -- ?\n, E'\\'?' AS h",
+                        ["x", 2.5, false, null, -9223372036854775807 as long - 1])
+    assertEq("${s.getString("a?")} ${s.getFloat("b")} ${s.get("c")} ${s.get("d")} ${s.getInt("e")} ${s.getString("f")} ${s.get("g")} ${s.getString("h")}",
+             "x? 2.5 false true -9223372036854775808 it's ? true '?")
+    let nums = db.queryOne("SELECT ?::float8 AS nan, ?::float8 AS inf, ?::bytea AS empty", [0.0 / 0.0, 1.0 / 0.0, Bytes.fromString("")])
+    assertEq("${nums.getFloat("nan") != nums.getFloat("nan")} ${nums.getFloat("inf") > 1e308} ${nums.getBytes("empty").size()}", "true true 0")
+    assertEq(db.ping() && db.serverVersion() != "", true)
+    db.exec("DROP TABLE gdb_users")
+    db.close()
+}
+
+test "errors name what went wrong" {
+    let db = fresh()
+    if (db == null) { return }
+    let msgs = new Array<string>()
+    try { db.insert("INSERT INTO gdb_users (email) VALUES (?)", ["ada@example.com"]) } catch (e: DbError) { msgs.push(e.state + " " + e.message()) }
+    try { db.query("SELECT nope FROM gdb_users") } catch (e: DbError) { msgs.push(e.state + " " + e.message() + " | " + e.sql) }
+    try { db.query("SELECT * FROM gdb_users WHERE id = ?", []) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.query("SELECT ?", [new Array<int>()]) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.query("SELECT ? + $1", [1]) } catch (e: DbError) { msgs.push(e.message()) }
+    try { db.exec("SELECT 1; SELEC 2") } catch (e: DbError) { msgs.push(e.state) }
+    assertEq(db.queryValue("SELECT 3") as long, 3 as long)
+    assertEq(Str.join(msgs, "\n"),
+             "23505 duplicate key value violates unique constraint \"gdb_users_email_key\"\n" +
+             "42703 column \"nope\" does not exist | SELECT nope FROM gdb_users\n" +
+             "the SQL has 1 placeholder(s) but 0 argument(s) were given\n" +
+             "argument 1 is an object of class Array: SQL takes numbers, bools, strings, Bytes and null\n" +
+             "the SQL mixes ? and $n placeholders: use one kind\n" +
+             "42601")
+    db.exec("DROP TABLE gdb_users")
+    let st = db.prepare("SELECT 1")
+    db.close()
+    let closed = 0
+    try { db.query("SELECT 1") } catch (e: StateError) { closed += 1 }
+    try { st.query([]) } catch (e: StateError) { closed += 1 }
+    assertEq(closed, 2)
+}
+
+test "transactions, savepoints, and a failed statement inside one" {
+    let db = fresh()
+    if (db == null) { return }
+    db.transaction(fn() {
+        db.execute("UPDATE gdb_users SET age = 1")
+        let inner = false
+        try {
+            db.transaction(fn() { db.execute("UPDATE gdb_users SET age = 2"); db.execute("SELECT nope") })
+        } catch (e: DbError) { inner = true }
+        assertEq(inner, true)
+        assertEq(db.queryValue("SELECT MAX(age) FROM gdb_users") as long, 1 as long)   // (the savepoint undid the failure)
+    })
+    assertEq(db.queryValue("SELECT MAX(age) FROM gdb_users") as long, 1 as long)
+    let outer = false
+    try { db.transaction(fn() { db.execute("DELETE FROM gdb_users"); throw new ValueError("boom") }) } catch (e: ValueError) { outer = true }
+    assertEq(outer && db.queryValue("SELECT COUNT(*) FROM gdb_users") as long == 2 as long, true)
+    db.exec("DROP TABLE gdb_users")
+    db.close()
+}
+
+test "statements, streaming, the cache and types" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_n; CREATE TABLE gdb_n (v INT PRIMARY KEY, b BYTEA)")
+    let st = db.prepare("INSERT INTO gdb_n (v) VALUES (?)")
+    db.transaction(fn() { for (i in 0..1000) { st.run([i]) } })
+    st.close()
+    assertEq(db.queryValue("SELECT SUM(v) FROM gdb_n") as long, 499500 as long)
+    let seen = new Array<string>()
+    db.each("SELECT v FROM gdb_n WHERE v < ? ORDER BY v", [3], fn(r: Row) {
+        let twice = db.queryValue("SELECT v * 2 FROM gdb_n WHERE v = ?", [r.get("v")]) as long
+        let again = db.query("SELECT v FROM gdb_n WHERE v < ? ORDER BY v", [2]).size()
+        seen.push("${r.getInt("v")}:${twice}:${again}")
+    })
+    assertEq(Str.join(seen, " "), "0:0:2 1:2:2 2:4:2")
+    for (i in 0..300) { assertEq(db.queryValue("SELECT v FROM gdb_n WHERE v = ?", [i]) as long, i as long) }
+    // The same SQL with a string, then Bytes, then null for one parameter: prepared again as needed.
+    db.execute("UPDATE gdb_n SET b = ? WHERE v = 1", ["\\x0102"])
+    db.execute("UPDATE gdb_n SET b = ? WHERE v = 2", [Bytes.fromHex("ff00")])
+    db.execute("UPDATE gdb_n SET b = ? WHERE v = 3", [null])
+    let bs = db.query("SELECT b FROM gdb_n WHERE v IN (1, 2, 3) ORDER BY v")
+    assertEq("${bs.get(0).getBytes("b").toHex()} ${bs.get(1).getBytes("b").toHex()} ${bs.get(2).isNull("b")}", "0102 ff00 true")
+    // More statements than the cache keeps: the old ones are deallocated on the server.
+    for (i in 0..600) { assertEq(db.queryValue("SELECT ${i} + ?", [1]) as long, (i + 1) as long) }
+    assertEq(db.queryValue("SELECT COUNT(*) FROM pg_prepared_statements") as long <= 260 as long, true)
+    let stopped = false
+    try { db.each("SELECT v FROM gdb_n", [], fn(r: Row) { throw new ValueError("stop") }) } catch (e: ValueError) { stopped = true }
+    assertEq(stopped && db.query("SELECT v FROM gdb_n").size() == 1000, true)
+    db.exec("DROP TABLE gdb_n")
+    db.close()
+}
+
+test "executeMany pipelines the rows" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_m; CREATE TABLE gdb_m (id INT PRIMARY KEY, name TEXT, b BYTEA)")
+    let rows = new Array<Array<any>>()
+    for (i in 0..20000) {
+        let b: any = i % 3 == 0 ? null : Bytes.fromHex("00ff27")
+        rows.push([i, "n'${i}", b])
+    }
+    assertEq(db.executeMany("INSERT INTO gdb_m (id, name, b) VALUES (?, ?, ?)", rows), 20000 as long)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_m WHERE b IS NULL") as long, 6667 as long)
+    let last = db.queryOne("SELECT name, b FROM gdb_m WHERE id = 19999")
+    assertEq(last.getString("name") + " " + last.getBytes("b").toHex(), "n'19999 00ff27")
+    let more = new Array<Array<any>>()
+    more.push(["a", 1]); more.push(["b", 2]); more.push(["c", 99999])
+    assertEq(db.executeMany("UPDATE gdb_m SET name = ? WHERE id = ?", more), 2 as long)
+    // A failing row (in the second batch of 256) undoes them all.
+    let bad = new Array<Array<any>>()
+    for (i in 0..300) { bad.push([50000 + i, "x"]) }
+    bad.push([1, "dup"])
+    let failed = ""
+    try { db.executeMany("INSERT INTO gdb_m (id, name) VALUES (?, ?)", bad) } catch (e: DbError) { failed = e.state }
+    assertEq(failed, "23505")
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_m WHERE id >= 50000") as long, 0 as long)
+    assertEq(db.inTransaction(), false)
+    db.exec("DROP TABLE gdb_m")
+    db.close()
+}
+
+test "a pool shared by threads" {
+    let first = server()
+    if (first == null) { return }
+    first.exec("DROP TABLE IF EXISTS gdb_hits; CREATE TABLE gdb_hits (worker INT, n INT)")
+    first.close()
+    let url = env("GRAV_DB_POSTGRES")
+    let pool = new Pool(3, fn() -> Connection => Postgres.open(url))
+    let threads = new Array<Thread>()
+    for (w in 0..6) {
+        threads.push(Thread.spawn(fn() {
+            for (i in 0..50) {
+                pool.with(fn(c: Connection) { c.execute("INSERT INTO gdb_hits (worker, n) VALUES (?, ?)", [w, i]) })
+            }
+        }))
+    }
+    for (t in threads) { t.join() }
+    assertEq(pool.opened() <= 3, true)
+    pool.with(fn(c: Connection) {
+        assertEq(c.queryValue("SELECT COUNT(*) FROM gdb_hits") as long, 300 as long)
+        c.exec("DROP TABLE gdb_hits")
+    })
+    pool.close()
+}

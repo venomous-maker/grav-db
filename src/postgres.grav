@@ -1,0 +1,764 @@
+// postgres.grav — PostgreSQL servers, using the system's libpq.
+//
+//   let db = Postgres.open("postgresql://app:secret@localhost/shop")
+//   db.exec("CREATE TABLE IF NOT EXISTS notes (id BIGSERIAL PRIMARY KEY, body TEXT)")
+//   db.insert("INSERT INTO notes (body) VALUES (?)", ["hello"])
+//   print(db.queryValue("SELECT COUNT(*) FROM notes"))
+//
+// libpq is loaded the first time a connection is made; without it,
+// Postgres.available() is false and connecting throws StateError. Statements
+// use `?` placeholders like the other drivers (written as $1, $2, ... for the
+// server; `??` is a literal `?`, as in jsonb's `??|`), or $1, $2, ... directly.
+// A connection prepares each statement on the server once and runs it with the
+// arguments sent apart from the SQL, and executeMany pipelines its rows.
+// Integer columns come out as long, real and double precision as float,
+// boolean as bool, bytea as Bytes, NULL as null, and everything else (numeric,
+// dates, text, json, uuid, arrays) as string.
+import "std"
+import "database.grav"
+
+namespace db {
+
+    %{
+    #include <dlfcn.h>
+    #include <pthread.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <math.h>
+    static struct {
+        void* (*connectdbParams)(const char* const*, const char* const*, int);
+        int (*status)(const void*);
+        char* (*errorMessage)(const void*);
+        void (*finish)(void*);
+        void* (*setNoticeProcessor)(void*, void (*)(void*, const char*), void*);
+        void* (*exec)(void*, const char*);
+        void* (*prepare)(void*, const char*, const char*, int, const unsigned int*);
+        void* (*execPrepared)(void*, const char*, int, const char* const*, const int*, const int*, int);
+        int (*resultStatus)(const void*);
+        char* (*resultErrorField)(const void*, int);
+        void (*clear)(void*);
+        int (*ntuples)(const void*);
+        int (*nfields)(const void*);
+        char* (*fname)(const void*, int);
+        unsigned int (*ftype)(const void*, int);
+        char* (*getvalue)(const void*, int, int);
+        int (*getlength)(const void*, int, int);
+        int (*getisnull)(const void*, int, int);
+        char* (*cmdTuples)(void*);
+        int (*transactionStatus)(const void*);
+        const char* (*parameterStatus)(const void*, const char*);
+        int (*libVersion)(void);
+        char* (*db)(const void*);
+        char* (*user)(const void*);
+        char* (*host)(const void*);
+        char* (*port)(const void*);
+    } grav_pg;
+    static struct {                                    /* pipeline mode (libpq 14 and later) */
+        int (*enter)(void*);
+        int (*exit)(void*);
+        int (*sync)(void*);
+        int (*sendQueryPrepared)(void*, const char*, int, const char* const*, const int*, const int*, int);
+        void* (*getResult)(void*);
+    } grav_pg_pipe;
+    static int grav_pg_ok = 0, grav_pg_piped = 0;
+    static pthread_once_t grav_pg_once = PTHREAD_ONCE_INIT;
+    enum { GRAV_PG_EMPTY = 0, GRAV_PG_COMMAND = 1, GRAV_PG_TUPLES = 2, GRAV_PG_SYNC = 10 };
+
+    static void grav_pg_load(void) {
+        static const char* const names[] = { "libpq.so.5", "libpq.so", "libpq.5.dylib", "libpq.dylib", 0 };
+        void* h = 0;
+        for (int i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) return;
+    #define GRAV_PG_FN(s, field, name) *(void**)(&s.field) = dlsym(h, name)
+        GRAV_PG_FN(grav_pg, connectdbParams, "PQconnectdbParams"); GRAV_PG_FN(grav_pg, status, "PQstatus");
+        GRAV_PG_FN(grav_pg, errorMessage, "PQerrorMessage"); GRAV_PG_FN(grav_pg, finish, "PQfinish");
+        GRAV_PG_FN(grav_pg, setNoticeProcessor, "PQsetNoticeProcessor"); GRAV_PG_FN(grav_pg, exec, "PQexec");
+        GRAV_PG_FN(grav_pg, prepare, "PQprepare"); GRAV_PG_FN(grav_pg, execPrepared, "PQexecPrepared");
+        GRAV_PG_FN(grav_pg, resultStatus, "PQresultStatus"); GRAV_PG_FN(grav_pg, resultErrorField, "PQresultErrorField");
+        GRAV_PG_FN(grav_pg, clear, "PQclear"); GRAV_PG_FN(grav_pg, ntuples, "PQntuples");
+        GRAV_PG_FN(grav_pg, nfields, "PQnfields"); GRAV_PG_FN(grav_pg, fname, "PQfname");
+        GRAV_PG_FN(grav_pg, ftype, "PQftype"); GRAV_PG_FN(grav_pg, getvalue, "PQgetvalue");
+        GRAV_PG_FN(grav_pg, getlength, "PQgetlength"); GRAV_PG_FN(grav_pg, getisnull, "PQgetisnull");
+        GRAV_PG_FN(grav_pg, cmdTuples, "PQcmdTuples"); GRAV_PG_FN(grav_pg, transactionStatus, "PQtransactionStatus");
+        GRAV_PG_FN(grav_pg, parameterStatus, "PQparameterStatus"); GRAV_PG_FN(grav_pg, libVersion, "PQlibVersion");
+        GRAV_PG_FN(grav_pg, db, "PQdb"); GRAV_PG_FN(grav_pg, user, "PQuser");
+        GRAV_PG_FN(grav_pg, host, "PQhost"); GRAV_PG_FN(grav_pg, port, "PQport");
+        GRAV_PG_FN(grav_pg_pipe, enter, "PQenterPipelineMode"); GRAV_PG_FN(grav_pg_pipe, exit, "PQexitPipelineMode");
+        GRAV_PG_FN(grav_pg_pipe, sync, "PQpipelineSync"); GRAV_PG_FN(grav_pg_pipe, sendQueryPrepared, "PQsendQueryPrepared");
+        GRAV_PG_FN(grav_pg_pipe, getResult, "PQgetResult");
+    #undef GRAV_PG_FN
+        void** all = (void**)&grav_pg;
+        for (size_t i = 0; i < sizeof grav_pg / sizeof(void*); i++) if (!all[i]) return;
+        grav_pg_ok = 1;
+        void** pipe = (void**)&grav_pg_pipe;
+        grav_pg_piped = 1;
+        for (size_t i = 0; i < sizeof grav_pg_pipe / sizeof(void*); i++) if (!pipe[i]) grav_pg_piped = 0;
+    }
+    static int grav_pg_ready(void) { pthread_once(&grav_pg_once, grav_pg_load); return grav_pg_ok; }
+    static void grav_pg_quiet(void* arg, const char* message) { (void)arg; (void)message; }   /* NOTICEs are not printed */
+    static const char* grav_pg_copy(const char* s, long n) {
+        if (!s) s = "";
+        if (n < 0) n = (long)strlen(s);
+        char* out = grav_str_alloc((size_t)n + 1);
+        if (!out) abort();
+        memcpy(out, s, (size_t)n);
+        out[n] = 0;
+        return out;
+    }
+    /* What went wrong: the server's message for result r, else libpq's for the
+       connection (without its "ERROR:  " and trailing newline). */
+    static const char* grav_pg_message(void* r, void* pg) {
+        const char* m = r ? grav_pg.resultErrorField(r, 'M') : 0;
+        if (m) return grav_pg_copy(m, -1);
+        m = grav_pg.errorMessage(pg);
+        if (!m || !*m) return grav_pg_copy("the connection to the server was lost", -1);
+        if (!strncmp(m, "ERROR:  ", 8)) m += 8;
+        long n = (long)strlen(m);
+        while (n > 0 && (m[n - 1] == '\n' || m[n - 1] == ' ')) n--;
+        return grav_pg_copy(m, n);
+    }
+    static const char* grav_pg_state(void* r) { return grav_pg_copy(r ? grav_pg.resultErrorField(r, 'C') : 0, -1); }
+
+    /* A connection shared by its PostgresConnection and its statements: closed
+       (pg = 0) by the connection, freed when the last of them lets go. Statements
+       closed on any thread leave their DEALLOCATEs in `pend`, sent by the
+       connection's own thread before it next prepares one. */
+    typedef struct {
+        void* pg;
+        int refs;
+        unsigned next;                                 /* for statement names */
+        long long changes;                             /* rows the last statement changed */
+        pthread_mutex_t mu;
+        char* pend;
+        size_t plen, pcap;
+    } grav_pg_conn;
+    static grav_pg_conn* grav_pg_conn_new(void* pg) {
+        grav_pg_conn* c = (grav_pg_conn*)calloc(1, sizeof *c);
+        if (!c) abort();
+        c->pg = pg; c->refs = 1;
+        pthread_mutex_init(&c->mu, 0);
+        return c;
+    }
+    static void grav_pg_conn_close(grav_pg_conn* c) {
+        pthread_mutex_lock(&c->mu);
+        if (c->pg) { grav_pg.finish(c->pg); c->pg = 0; }
+        c->plen = 0;
+        pthread_mutex_unlock(&c->mu);
+    }
+    static void grav_pg_conn_unref(grav_pg_conn* c) {
+        if (__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL) != 0) return;
+        grav_pg_conn_close(c);
+        pthread_mutex_destroy(&c->mu);
+        free(c->pend);
+        free(c);
+    }
+    static void grav_pg_forget(grav_pg_conn* c, const char* name) {
+        pthread_mutex_lock(&c->mu);
+        if (c->pg) {
+            size_t n = strlen(name) + 13;
+            if (c->plen + n + 1 > c->pcap) {
+                size_t cap = c->pcap ? c->pcap * 2 : 512;
+                while (cap < c->plen + n + 1) cap *= 2;
+                char* p = (char*)realloc(c->pend, cap);
+                if (!p) abort();
+                c->pend = p; c->pcap = cap;
+            }
+            c->plen += (size_t)sprintf(c->pend + c->plen, "DEALLOCATE %s;", name);
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    /* Sends the waiting DEALLOCATEs (not in a failed transaction: they would fail too). */
+    static void grav_pg_flush(grav_pg_conn* c) {
+        if (!c->plen || grav_pg.transactionStatus(c->pg) == 3 /* INERROR */) return;
+        pthread_mutex_lock(&c->mu);
+        void* r = grav_pg.exec(c->pg, c->pend);
+        c->plen = 0;
+        pthread_mutex_unlock(&c->mu);
+        if (r) grav_pg.clear(r);
+    }
+
+    /* A statement: its SQL with $n placeholders, its name on the server once
+       prepared and the parameter types it was prepared with (17, bytea, for a
+       Bytes argument; 0, for the server to infer, otherwise), and this run's
+       arguments. */
+    typedef struct {
+        grav_pg_conn* c;
+        char* sql;
+        int n, prepared;
+        char name[24];
+        unsigned* types;                               /* prepared with */
+        unsigned* want;                                /* this run needs */
+        const char** vals;
+        int* lens;
+        int* fmts;
+        char* nums;                                    /* text of number arguments, 32 bytes each */
+        void* err;                                     /* a failed result, for the caller to read */
+    } grav_pg_stmt;
+    static int grav_pg_ident(char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || (unsigned char)ch >= 128;
+    }
+    /* `sql` with each `?` as $1, $2, ... (`??` as `?`), skipping strings,
+       quoted identifiers, dollar quotes and comments. *count is how many
+       parameters it takes; -1 when it mixes `?` and $n. */
+    static char* grav_pg_convert(const char* s, int* count) {
+        size_t n = strlen(s), o = 0;
+        char* out = (char*)malloc(n * 6 + 1);
+        if (!out) abort();
+        int k = 0, most = 0;
+        for (size_t i = 0; i < n; ) {
+            char ch = s[i];
+            size_t j = i + 1;
+            if (ch == '\'') {
+                int esc = i > 0 && (s[i - 1] == 'E' || s[i - 1] == 'e') && (i < 2 || !grav_pg_ident(s[i - 2]));
+                for (; j < n; j++) {
+                    if (esc && s[j] == '\\') { j++; continue; }
+                    if (s[j] == '\'') { if (j + 1 < n && s[j + 1] == '\'') { j++; continue; } j++; break; }
+                }
+            } else if (ch == '"') {
+                for (; j < n; j++) if (s[j] == '"') { if (j + 1 < n && s[j + 1] == '"') { j++; continue; } j++; break; }
+            } else if (ch == '-' && j < n && s[j] == '-') {
+                while (j < n && s[j] != '\n') j++;
+            } else if (ch == '/' && j < n && s[j] == '*') {
+                int depth = 1;
+                for (j++; j < n && depth; j++) {
+                    if (s[j] == '/' && j + 1 < n && s[j + 1] == '*') { depth++; j++; }
+                    else if (s[j] == '*' && j + 1 < n && s[j + 1] == '/') { depth--; j++; }
+                }
+            } else if (ch == '$' && (i == 0 || !grav_pg_ident(s[i - 1]))) {
+                if (j < n && s[j] >= '0' && s[j] <= '9') {
+                    int d = 0;
+                    while (j < n && s[j] >= '0' && s[j] <= '9') d = d * 10 + (s[j++] - '0');
+                    if (d > most) most = d;
+                } else {
+                    size_t t = j;                      /* $tag$ ... $tag$ */
+                    while (t < n && grav_pg_ident(s[t]) && !(t == j && s[t] >= '0' && s[t] <= '9')) t++;
+                    if (t < n && s[t] == '$') {
+                        size_t len = t + 1 - i;
+                        const char* end = 0;
+                        for (size_t q = t + 1; q + len <= n; q++) if (!memcmp(s + q, s + i, len)) { end = s + q; break; }
+                        j = end ? (size_t)(end - s) + len : n;
+                    }
+                }
+            } else if (ch == '?') {
+                if (j < n && s[j] == '?') { out[o++] = '?'; i += 2; continue; }
+                o += (size_t)sprintf(out + o, "$%d", ++k);
+                i = j;
+                continue;
+            }
+            memcpy(out + o, s + i, j - i);
+            o += j - i;
+            i = j;
+        }
+        out[o] = 0;
+        *count = k && most ? -1 : k ? k : most;
+        return out;
+    }
+    static grav_pg_stmt* grav_pg_stmt_new(grav_pg_conn* c, const char* sql) {
+        grav_pg_stmt* h = (grav_pg_stmt*)calloc(1, sizeof *h);
+        if (!h) abort();
+        h->sql = grav_pg_convert(sql, &h->n);
+        if (h->n < 0) return h;                        /* (the caller reports it and frees h) */
+        __atomic_add_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
+        h->c = c;
+        int m = h->n ? h->n : 1;
+        h->types = (unsigned*)calloc((size_t)m, sizeof(unsigned));
+        h->want = (unsigned*)calloc((size_t)m, sizeof(unsigned));
+        h->vals = (const char**)calloc((size_t)m, sizeof(char*));
+        h->lens = (int*)calloc((size_t)m, sizeof(int));
+        h->fmts = (int*)calloc((size_t)m, sizeof(int));
+        h->nums = (char*)malloc((size_t)m * 32);
+        if (!h->types || !h->want || !h->vals || !h->lens || !h->fmts || !h->nums) abort();
+        return h;
+    }
+    static void grav_pg_stmt_release(grav_pg_stmt* h) {   /* forgets it on the server */
+        if (h->prepared && h->c) grav_pg_forget(h->c, h->name);
+        h->prepared = 0;
+    }
+    static void grav_pg_stmt_free(grav_pg_stmt* h) {
+        grav_pg_stmt_release(h);
+        if (h->err) grav_pg.clear(h->err);
+        if (h->c) grav_pg_conn_unref(h->c);
+        free(h->sql); free(h->types); free(h->want); free(h->vals); free(h->lens); free(h->fmts); free(h->nums); free(h);
+    }
+    /* Sets argument i: 0 done, -1 for a kind it cannot take. */
+    static int grav_pg_arg(grav_pg_stmt* h, int i, GravAny v) {
+        char* t = h->nums + 32 * i;
+        h->fmts[i] = 0;
+        h->want[i] = 0;
+        switch (v.tag) {
+            case GRAV_ANY_NULL: h->vals[i] = 0; h->want[i] = h->types[i]; return 0;   /* (fits any type) */
+            case GRAV_ANY_INT: case GRAV_ANY_ENUM: snprintf(t, 32, "%lld", (long long)v.v.i); break;
+            case GRAV_ANY_UINT: snprintf(t, 32, "%llu", (unsigned long long)v.v.u); break;
+            case GRAV_ANY_BOOL: strcpy(t, v.v.b ? "true" : "false"); break;
+            case GRAV_ANY_FLOAT: {
+                double d = v.v.f;
+                if (isnan(d)) strcpy(t, "NaN");
+                else if (isinf(d)) strcpy(t, d > 0 ? "Infinity" : "-Infinity");
+                else for (int p = 15; p <= 17; p++) { snprintf(t, 32, "%.*g", p, d); if (strtod(t, 0) == d) break; }
+                break;
+            }
+            case GRAV_ANY_STR: h->vals[i] = v.v.s; h->lens[i] = (int)grav_str_len(v.v.s); return 0;
+            default: return -1;
+        }
+        h->vals[i] = t;
+        return 0;
+    }
+    /* Sets a[from..n): n when all are set, else the index of the first that is not a scalar. */
+    static int grav_pg_args(grav_pg_stmt* h, const GravAny* a, int from, int n) {
+        for (int i = from; i < n; i++) if (grav_pg_arg(h, i, a[i])) return i;
+        return n;
+    }
+    static void grav_pg_bytes(grav_pg_stmt* h, int i, const unsigned char* p, int n) {
+        h->vals[i] = n ? (const char*)p : "";          /* (a null pointer would be SQL NULL) */
+        h->lens[i] = n;
+        h->fmts[i] = 1;
+        h->want[i] = 17;
+    }
+    /* Prepares it on the server if it is not yet, or was with other parameter
+       types: 0, or -1 with the failed result in h->err. */
+    static int grav_pg_ready_stmt(grav_pg_stmt* h) {
+        if (h->prepared && !memcmp(h->types, h->want, (size_t)h->n * sizeof(unsigned))) return 0;
+        grav_pg_stmt_release(h);
+        grav_pg_flush(h->c);
+        snprintf(h->name, sizeof h->name, "grav_%u", h->c->next++);
+        memcpy(h->types, h->want, (size_t)h->n * sizeof(unsigned));
+        void* r = grav_pg.prepare(h->c->pg, h->name, h->sql, h->n, h->types);
+        if (!r || grav_pg.resultStatus(r) != GRAV_PG_COMMAND) { h->err = r; return -1; }
+        grav_pg.clear(r);
+        h->prepared = 1;
+        return 0;
+    }
+    /* Runs it with the arguments set: its result, or null with the failure in h->err. */
+    static void* grav_pg_run(grav_pg_stmt* h) {
+        if (grav_pg_ready_stmt(h)) return 0;
+        void* r = grav_pg.execPrepared(h->c->pg, h->name, h->n, h->vals, h->lens, h->fmts, 0);
+        int st = r ? grav_pg.resultStatus(r) : -1;
+        if (st != GRAV_PG_COMMAND && st != GRAV_PG_TUPLES && st != GRAV_PG_EMPTY) { h->err = r; return 0; }
+        h->c->changes = atoll(grav_pg.cmdTuples(r));
+        return r;
+    }
+    /* In pipeline mode: queues a run with the arguments set (0, or -1 when it
+       could not be sent). */
+    static int grav_pg_queue(grav_pg_stmt* h) {
+        return grav_pg_pipe.sendQueryPrepared(h->c->pg, h->name, h->n, h->vals, h->lens, h->fmts, 0) ? 0 : -1;
+    }
+    /* Ends a pipelined batch of `count` runs: the rows they changed, or -1 with
+       the first failure in h->err. */
+    static long long grav_pg_collect(grav_pg_stmt* h, int count) {
+        void* pg = h->c->pg;
+        long long total = 0;
+        int failed = 0, nulls = 0;
+        if (!grav_pg_pipe.sync(pg)) { h->err = 0; return -1; }
+        for (;;) {
+            void* r = grav_pg_pipe.getResult(pg);
+            if (!r) {                                  /* (between one run's results and the next's) */
+                if (grav_pg.status(pg) != 0 || ++nulls > count + 2) { if (!failed) h->err = 0; return -1; }
+                continue;
+            }
+            int st = grav_pg.resultStatus(r);
+            if (st == GRAV_PG_SYNC) { grav_pg.clear(r); break; }
+            if (st == GRAV_PG_COMMAND || st == GRAV_PG_TUPLES) total += atoll(grav_pg.cmdTuples(r));
+            else if (!failed && st != 11 /* PIPELINE_ABORTED */) { failed = 1; h->err = r; continue; }
+            grav_pg.clear(r);
+        }
+        h->c->changes = total;
+        return failed ? -1 : total;
+    }
+
+    /* Writes row `row`'s n values to out[0..n). A bytea is left null and
+       counted: the caller makes its Bytes. Returns how many there were. */
+    static int grav_pg_fill(void* r, int row, int n, GravAny* out) {
+        int bins = 0;
+        for (int i = 0; i < n; i++) {
+            GravAny a;
+            memset(&a, 0, sizeof a);
+            if (!grav_pg.getisnull(r, row, i)) {
+                const char* p = grav_pg.getvalue(r, row, i);
+                switch (grav_pg.ftype(r, i)) {
+                    case 20: case 21: case 23: case 26: case 28: {     /* int8, int2, int4, oid, xid */
+                        long long x = 0;
+                        int neg = *p == '-';
+                        for (const char* q = p + neg; *q >= '0' && *q <= '9'; q++) x = x * 10 + (*q - '0');
+                        a.tag = GRAV_ANY_INT; a.v.i = neg ? -x : x;
+                        break;
+                    }
+                    case 700: case 701: a.tag = GRAV_ANY_FLOAT; a.v.f = strtod(p, 0); break;
+                    case 16: a.tag = GRAV_ANY_BOOL; a.v.b = *p == 't'; break;
+                    case 17: bins++; break;
+                    default: a.tag = GRAV_ANY_STR; a.v.s = grav_pg_copy(p, grav_pg.getlength(r, row, i));
+                }
+            }
+            out[i] = a;
+        }
+        return bins;
+    }
+    /* A bytea value's bytes, decoded from its hex text in place: their count. */
+    static int grav_pg_unhex(void* r, int row, int i, unsigned char** at) {
+        char* p = grav_pg.getvalue(r, row, i);
+        int n = grav_pg.getlength(r, row, i);
+        *at = (unsigned char*)p;
+        if (n < 2 || p[0] != '\\' || p[1] != 'x') return n;   /* (bytea_output = escape: left as it is) */
+        int k = 0;
+        for (int j = 2; j + 1 < n; j += 2) {
+            int hi = p[j] <= '9' ? p[j] - '0' : (p[j] | 32) - 'a' + 10;
+            int lo = p[j + 1] <= '9' ? p[j + 1] - '0' : (p[j + 1] | 32) - 'a' + 10;
+            p[k++] = (char)(hi << 4 | lo);
+        }
+        return k;
+    }
+    %}
+
+    // Connecting to PostgreSQL servers.
+    class Postgres {
+        // Whether libpq could be loaded.
+        static fn available() -> bool { return %{ grav_pg_ready() %} as bool; }
+        // libpq's version, as PostgreSQL numbers them (180001 for 18.1).
+        static fn libVersion() -> int {
+            Postgres.need();
+            return %{ grav_pg.libVersion() %} as int;
+        }
+        // Connects with a URL, "postgresql://user:password@host:5432/database"
+        // ("postgres://" too; ?sslmode=require and libpq's other options go in its
+        // query), or libpq's "host=... dbname=..." form. Unless it says otherwise,
+        // waits 10 s at most for the server. The connection talks UTF-8.
+        static fn open(url: string) -> PostgresConnection {
+            Postgres.need();
+            let pg = %{ ({ const char* const keys[] = { "connect_timeout", "fallback_application_name", "dbname", "client_encoding", 0 };
+                           const char* const vals[] = { "10", "grav", url, "UTF8", 0 };
+                           grav_pg.connectdbParams(keys, vals, 1); }) %} as byte*;
+            if (pg == null) { throw new DbError("out of memory", 0, ""); }
+            if (%{ grav_pg.status(pg) %} as int != 0) {
+                let why = %{ grav_pg_message(0, pg) %} as string;
+                %{ grav_pg.finish(pg); %};
+                throw new DbError("cannot connect to PostgreSQL: " + why, 0, "");
+            }
+            %{ grav_pg.setNoticeProcessor(pg, grav_pg_quiet, 0); %};
+            let host = %{ grav_pg_copy(grav_pg.host(pg), -1) %} as string;
+            let where = "postgresql://" + (%{ grav_pg_copy(grav_pg.user(pg), -1) %} as string) + "@" + host + ":" +
+                        (%{ grav_pg_copy(grav_pg.port(pg), -1) %} as string) + "/" + (%{ grav_pg_copy(grav_pg.db(pg), -1) %} as string);
+            return new PostgresConnection(%{ grav_pg_conn_new(pg) %} as byte*, where);
+        }
+        private static fn need() {
+            if (!Postgres.available()) { throw new StateError("PostgreSQL is not available: libpq could not be loaded"); }
+        }
+    }
+
+    // A connection to a PostgreSQL server (see Connection for what it can do).
+    class PostgresConnection extends Connection {
+        private c: byte*                         // grav_pg_conn*
+        private cache: HashMap<string, PostgresStatement>
+        private recent: Array<PostgresStatement>    // 16 of the cached, by their SQL string's address (no hashing)
+        private openFlag: bool
+        // Where it is connected ("postgresql://app@/var/run/postgresql:5432/shop").
+        public url: string
+
+        constructor(c: byte*, url: string) {
+            super();
+            self.c = c;
+            self.url = url;
+            self.cache = new HashMap<string, PostgresStatement>();
+            self.recent = new Array<PostgresStatement>(16);
+            for (i in 0..16) { self.recent.push(null); }
+            self.openFlag = true;
+        }
+        destructor() {
+            self.close();
+            let c = self.c;
+            %{ grav_pg_conn_unref((grav_pg_conn*)c); %};
+        }
+
+        // A new statement for `sql` (yours to run and close).
+        fn prepare(sql: string) -> Statement { return self.make(sql); }
+        fn exec(sql: string) {
+            let pg = self.handle();
+            let c = self.c;
+            %{ grav_pg_flush((grav_pg_conn*)c); %};
+            let r = %{ grav_pg.exec(pg, sql) %} as byte*;
+            let st = r == null ? -1 : %{ grav_pg.resultStatus(r) %} as int;
+            if (st != 0 && st != 1 && st != 2) {
+                let e = new DbError(%{ grav_pg_message(r, pg) %} as string, 0, sql);
+                e.state = %{ grav_pg_state(r) %} as string;
+                if (r != null) { %{ grav_pg.clear(r); %}; }
+                throw e;
+            }
+            %{ grav_pg.clear(r); %};
+        }
+        // The value the last INSERT took from a sequence (a SERIAL or IDENTITY
+        // column): PostgreSQL's lastval().
+        fn lastInsertId() -> long {
+            let v = self.queryValue("SELECT lastval()");
+            return v as long;
+        }
+        // Runs an INSERT with `args`; the new row's id: the first column of its
+        // first row with a RETURNING clause (one round trip), else lastval().
+        fn insert(sql: string, args: Array<any> = new Array<any>()) -> long {
+            let st = self.borrow(sql) as PostgresStatement;
+            if (st.returnsRows(args)) { let r = st.lastRow(); return r == null ? 0 : r.getInt(r.columns()[0]); }
+            return self.lastInsertId();
+        }
+        // Rows the last INSERT, UPDATE or DELETE changed.
+        fn changes() -> long { self.handle(); let c = self.c; return %{ ((grav_pg_conn*)c)->changes %} as long; }
+        // The server's version ("18.1 (Debian 18.1-1)").
+        fn serverVersion() -> string {
+            let pg = self.handle();
+            return %{ grav_pg_copy(grav_pg.parameterStatus(pg, "server_version"), -1) %} as string;
+        }
+        // Whether the server still answers.
+        fn ping() -> bool {
+            let pg = self.handle();
+            return %{ ({ void* r = grav_pg.exec(pg, ""); int ok = r && grav_pg.resultStatus(r) == GRAV_PG_EMPTY;
+                         if (r) grav_pg.clear(r); ok && grav_pg.status(pg) == 0; }) %} as bool;
+        }
+        fn isOpen() -> bool { return self.openFlag; }
+        fn driver() -> string { return "postgres"; }
+        fn close() {
+            if (!self.openFlag) { return; }
+            self.openFlag = false;
+            for (st in self.cache.values()) { st.close(); }
+            self.cache.clear();
+            for (i in 0..16) { self.recent[i] = null; }
+            let c = self.c;
+            %{ grav_pg_conn_close((grav_pg_conn*)c); %};
+        }
+
+        // The cached statement for `sql` (safe to run again inside its own each():
+        // a result is read whole before its rows are handed out).
+        protected fn borrow(sql: string) -> Statement {
+            let slot = %{ (int)(((unsigned long)sql >> 4) & 15) %} as int;
+            let st = self.recent[slot];
+            if (st != null) { let had = st.sql; if (%{ had == sql %} as bool) { return st; } }   // (the very string: same SQL)
+            st = self.cache.getOr(sql, null);
+            if (st == null) {
+                if (self.cache.size() >= 256) {                       // (one still running keeps working)
+                    for (old in self.cache.values()) { old.close(); }
+                    self.cache.clear();
+                    for (i in 0..16) { self.recent[i] = null; }
+                }
+                st = self.make(sql);
+                self.cache.put(sql, st);
+            }
+            self.recent[slot] = st;
+            return st;
+        }
+        protected fn done(st: Statement) {}
+        // Pipelines the rows: sent without waiting for each one's answer.
+        protected fn batch(sql: string, rows: Array<Array<any>>) -> long {
+            if (!(%{ grav_pg_piped %} as bool)) { return super.batch(sql, rows); }
+            return (self.borrow(sql) as PostgresStatement).many(rows);
+        }
+
+        private fn make(sql: string) -> PostgresStatement {
+            self.handle();
+            let c = self.c;
+            let h = %{ grav_pg_stmt_new((grav_pg_conn*)c, sql) %} as byte*;
+            if (%{ ((grav_pg_stmt*)h)->n %} as int < 0) {
+                %{ grav_pg_stmt_free((grav_pg_stmt*)h); %};
+                throw new DbError("the SQL mixes ? and $n placeholders: use one kind", 0, sql);
+            }
+            return new PostgresStatement(sql, h);
+        }
+        private fn handle() -> byte* {
+            if (!self.openFlag) { throw new StateError("the PostgreSQL connection to " + self.url + " is closed"); }
+            let c = self.c;
+            return %{ ((grav_pg_conn*)c)->pg %} as byte*;
+        }
+    }
+
+    // A PostgreSQL statement (see Statement), prepared on the server when it
+    // first runs.
+    class PostgresStatement extends Statement {
+        private h: byte*                          // grav_pg_stmt*
+        private cols: Columns
+        private closed: bool
+        private last: Row                         // (for insert)
+
+        constructor(sql: string, h: byte*) {
+            super(sql);
+            self.h = h;
+            self.cols = null;
+            self.closed = false;
+            self.last = null;
+        }
+        destructor() {
+            let h = self.h;
+            %{ grav_pg_stmt_free((grav_pg_stmt*)h); %};
+        }
+
+        fn run(args: Array<any>) -> long {
+            let r = self.send(args);
+            let n = %{ atoll(grav_pg.cmdTuples(r)) %} as long;
+            %{ grav_pg.clear(r); %};
+            return n;
+        }
+        fn query(args: Array<any>) -> ResultSet {
+            let r = self.send(args);
+            let cols = self.columns(r);
+            let n = cols.size();
+            let rows = %{ grav_pg.ntuples(r) %} as int;
+            let vals = new Array<any>(rows * n);
+            for (i in 0..rows) { self.fill(vals, r, i, n); }
+            %{ grav_pg.clear(r); %};
+            return new ResultSet(cols, vals, rows);
+        }
+        fn queryOne(args: Array<any>) -> Row {
+            let r = self.send(args);
+            if (%{ grav_pg.ntuples(r) %} as int == 0) { %{ grav_pg.clear(r); %}; return null; }
+            let cols = self.columns(r);
+            let vals = new Array<any>(cols.size());
+            self.fill(vals, r, 0, cols.size());
+            %{ grav_pg.clear(r); %};
+            return new Row(cols, vals, 0);
+        }
+        fn each(args: Array<any>, f: fn(Row)) {
+            let r = self.send(args);
+            let cols = self.columns(r);
+            let n = cols.size();
+            let rows = %{ grav_pg.ntuples(r) %} as int;
+            for (i in 0..rows) {
+                let vals = new Array<any>(n);              // (each row its own: one kept past the call stays right)
+                self.fill(vals, r, i, n);
+                try { f(new Row(cols, vals, 0)); } catch (e: Exception) { %{ grav_pg.clear(r); %}; throw e; }
+            }
+            %{ grav_pg.clear(r); %};
+        }
+        fn close() {
+            if (self.closed) { return; }
+            self.closed = true;
+            let h = self.h;
+            %{ grav_pg_stmt_release((grav_pg_stmt*)h); %};
+        }
+
+        // Runs it; whether it gave rows (a RETURNING clause), keeping the first in lastRow().
+        fn returnsRows(args: Array<any>) -> bool {
+            let r = self.send(args);
+            let has = %{ grav_pg.nfields(r) %} as int > 0;
+            self.last = null;
+            if (has && %{ grav_pg.ntuples(r) %} as int > 0) {
+                let cols = self.columns(r);
+                let vals = new Array<any>(cols.size());
+                self.fill(vals, r, 0, cols.size());
+                self.last = new Row(cols, vals, 0);
+            }
+            %{ grav_pg.clear(r); %};
+            return has;
+        }
+        fn lastRow() -> Row { return self.last; }
+
+        // Runs it with each of `rows`, pipelined in batches of 256 (one sync each).
+        fn many(rows: Array<Array<any>>) -> long {
+            let h = self.h;
+            let pg = self.connection();
+            self.bind(rows[0]);
+            if (%{ grav_pg_ready_stmt((grav_pg_stmt*)h) %} as int != 0) { throw self.failure(pg); }
+            if (%{ grav_pg_pipe.enter(pg) %} as int == 0) { throw self.failure(pg); }
+            let total = 0 as long;
+            let queued = 0;
+            let problem: Exception = null;
+            for (k, row in rows) {
+                try {
+                    self.bind(row);
+                    if (%{ memcmp(((grav_pg_stmt*)h)->types, ((grav_pg_stmt*)h)->want, (size_t)((grav_pg_stmt*)h)->n * sizeof(unsigned)) %} as int != 0) {
+                        throw new DbError("row ${k + 1} has Bytes where another row has a different kind of value (or the other way round)", 0, self.sql);
+                    }
+                } catch (e: Exception) { problem = e; break; }
+                if (%{ grav_pg_queue((grav_pg_stmt*)h) %} as int != 0) { problem = self.failure(pg); break; }
+                queued += 1;
+                if (queued == 256) {
+                    let n = %{ grav_pg_collect((grav_pg_stmt*)h, queued) %} as long;
+                    queued = 0;
+                    if (n < 0) { problem = self.failure(pg); break; }
+                    total += n;
+                }
+            }
+            if (queued > 0) {
+                let n = %{ grav_pg_collect((grav_pg_stmt*)h, queued) %} as long;
+                if (n < 0 && problem == null) { problem = self.failure(pg); }
+                total += n;
+            }
+            %{ grav_pg_pipe.exit(pg); %};
+            if (problem != null) { throw problem; }
+            return total;
+        }
+
+        // Sets `args` (their count must match the placeholders).
+        private fn bind(args: Array<any>) {
+            let h = self.h;
+            let want = %{ ((grav_pg_stmt*)h)->n %} as int;
+            if (args.size() != want) {
+                throw new DbError("the SQL has ${want} placeholder(s) but ${args.size()} argument(s) were given", 0, self.sql);
+            }
+            let i = 0;
+            while (i < want) {
+                i = %{ grav_pg_args((grav_pg_stmt*)h, (const GravAny*)args->data, i, want) %} as int;   // the scalars, in C
+                if (i >= want) { break; }
+                let a = args[i];
+                if (a is Bytes) {
+                    let b = a as Bytes;
+                    let p = b.rawData();
+                    let n = b.size();
+                    %{ grav_pg_bytes((grav_pg_stmt*)h, i, (const unsigned char*)p, n); %};
+                    i += 1;
+                    continue;
+                }
+                let t = typename(a);                        // "std.collections.Array$int" -> "Array"
+                let dot = Str.lastIndexOf(t, ".");
+                if (dot >= 0) { t = t[dot + 1..]; }
+                let gen = Str.indexOf(t, "$");
+                if (gen > 0) { t = t[..gen]; }
+                throw new DbError("argument ${i + 1} is " + (a is fn() ? "a function" : "an object of class " + t) +
+                                  ": SQL takes numbers, bools, strings, Bytes and null", 0, self.sql);
+            }
+        }
+        // Binds and runs it: the result (the caller clears it).
+        private fn send(args: Array<any>) -> byte* {
+            let pg = self.connection();
+            self.bind(args);
+            let h = self.h;
+            let r = %{ grav_pg_run((grav_pg_stmt*)h) %} as byte*;
+            if (r == null) { throw self.failure(pg); }
+            return r;
+        }
+        private fn connection() -> byte* {
+            if (self.closed) { throw new StateError("the statement is closed: " + self.sql); }
+            let h = self.h;
+            let pg = %{ ((grav_pg_stmt*)h)->c->pg %} as byte*;
+            if (pg == null) { throw new StateError("the statement's PostgreSQL connection is closed: " + self.sql); }
+            return pg;
+        }
+        // The DbError for the failure left in h->err (which it clears).
+        private fn failure(pg: byte*) -> DbError {
+            let h = self.h;
+            let r = %{ ((grav_pg_stmt*)h)->err %} as byte*;
+            let e = new DbError(%{ grav_pg_message(r, pg) %} as string, 0, self.sql);
+            e.state = %{ grav_pg_state(r) %} as string;
+            %{ if (r) grav_pg.clear(r); ((grav_pg_stmt*)h)->err = 0; %};
+            return e;
+        }
+        private fn columns(r: byte*) -> Columns {
+            let n = %{ grav_pg.nfields(r) %} as int;
+            if (self.cols == null || self.cols.names.size() != n) {
+                let names = new Array<string>(n);
+                for (i in 0..n) { names.push(%{ grav_pg_copy(grav_pg.fname(r, i), -1) %} as string); }
+                self.cols = new Columns(names);
+            }
+            return self.cols;
+        }
+        // Appends row `row`'s n values to `vals` (filled in C; bytea becomes Bytes here).
+        private fn fill(vals: Array<any>, r: byte*, row: int, n: int) {
+            let at = vals.size();
+            vals.reserve(at + n);
+            let bins = %{ grav_pg_fill(r, row, n, (GravAny*)vals->data + vals->len) %} as int;
+            %{ vals->len += n; %};
+            if (bins == 0) { return; }
+            for (i in 0..n) {
+                if (%{ grav_pg.ftype(r, i) != 17 || grav_pg.getisnull(r, row, i) %} as bool) { continue; }
+                let p: byte* = null;
+                let len = %{ grav_pg_unhex(r, row, i, (unsigned char**)&p) %} as int;
+                let b = new Bytes();
+                if (len > 0) { b.appendRaw(p, len); }
+                vals.set(at + i, b);
+            }
+        }
+    }
+}

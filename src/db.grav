@@ -1,6 +1,7 @@
-// grav-db: databases for Grav (SQLite, MySQL and MariaDB). `import "grav-db"`
-// (or the name you gave the dependency) brings in the shared API (Connection,
-// Statement, ResultSet, Row, DbError, Pool) and the drivers.
+// grav-db: databases for Grav (SQLite, MySQL/MariaDB and PostgreSQL).
+// `import "grav-db"` (or the name you gave the dependency) brings in the shared
+// API (Connection, Statement, ResultSet, Row, DbError, Pool) and the drivers.
 import "database.grav"
 import "sqlite.grav"
 import "mysql.grav"
+import "postgres.grav"
