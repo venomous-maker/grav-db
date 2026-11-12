@@ -63,7 +63,7 @@ test "values in and out, NULL and blobs" {
     assertEq(rows.size(), 2)
     assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,role,note,price,born,big,flags")
     assertEq(rows.get(0).toString(), "{id: 1, email: \"ada@example.com\", age: 36, score: 9.5, active: 1, role: 2, note: \"it's \"quoted\" \\ ünï\", " +
-                                     "price: \"19.99\", born: \"1815-12-10\", big: 18446744073709551615, flags: 5}")
+                                     "price: \"19.99\", born: 1815-12-10 00:00:00, big: 18446744073709551615, flags: 5}")
     assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, role: NULL, note: NULL, " +
                                      "price: NULL, born: NULL, big: NULL, flags: NULL}")
     let ada = db.queryOne("SELECT * FROM gdb_users WHERE email = ?", ["ada@example.com"])
@@ -217,5 +217,29 @@ test "executeMany: one multi-row INSERT, or row by row" {
     assertEq(failed, "1062 23000")
     assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_m WHERE id = 50000") as long, 0 as long)
     db.exec("DROP TABLE gdb_m")
+    db.close()
+}
+
+test "dates and times come out as DateTime" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("SET SESSION sql_mode = ''; DROP TABLE IF EXISTS gdb_t; " +
+            "CREATE TABLE gdb_t (id INT PRIMARY KEY, d DATE, dt DATETIME(6), ts TIMESTAMP(3) NULL, t TIME, z DATETIME, e DATETIME)")
+    let when = DateTime.parse("2024-02-28 09:30:15.123456")
+    db.execute("INSERT INTO gdb_t VALUES (1, ?, ?, ?, ?, '0000-00-00 00:00:00', ?)", [DateTime.parse("2024-02-28"), when, when, "12:34:56", null])
+    let r = db.queryOne("SELECT d, dt, ts, t, z, e FROM gdb_t")
+    assertEq("${r.get("d")} | ${r.get("dt")} | ${r.get("ts")} | ${r.get("t")} | ${r.get("z")} | ${r.get("e")}",
+             "2024-02-28 00:00:00 | 2024-02-28 09:30:15.123456 | 2024-02-28 09:30:15.123000 | 12:34:56 | 0000-00-00 00:00:00 | null")
+    assertEq(r.get("dt") is DateTime && r.get("t") is string && r.get("z") is string, true)   // (TIME and zero dates stay text)
+    assertEq(r.getDateTime("dt") == when && r.getDateTime("e") == null, true)
+    assertEq(db.queryValue("SELECT id FROM gdb_t WHERE dt = ?", [when]) as long, 1 as long)
+    let rows = new Array<Array<any>>()
+    for (i in 2..5) { rows.push([i, when.addDays(i)]) }
+    db.executeMany("INSERT INTO gdb_t (id, dt) VALUES (?, ?)", rows)
+    assertEq(db.queryOne("SELECT dt FROM gdb_t WHERE id = 4").getDateTime("dt").toString(), "2024-03-03 09:30:15.123456")
+    let bad = ""
+    try { r.getDateTime("t") } catch (e: ValueError) { bad = e.message() }
+    assertEq(bad, "column 't' is not a date: 12:34:56")
+    db.exec("DROP TABLE gdb_t")
     db.close()
 }

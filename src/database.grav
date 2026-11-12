@@ -11,8 +11,12 @@
 //   db.transaction(fn() { db.execute("UPDATE users SET age = age + 1") })
 //
 // Values go in and come out as `any`: whole numbers, floats, bools, strings,
-// Bytes and null (an enum goes in as its number). A connection is used by one
-// thread at a time; Pool lends connections to many.
+// Bytes, DateTimes and null (an enum goes in as its number). Date and time
+// columns come out as DateTime (to the microsecond; a value it cannot hold, such
+// as MySQL's 0000-00-00 or PostgreSQL's infinity, stays a string), and a
+// DateTime argument goes in as its local time ("2024-02-28 09:30:15.250000";
+// PostgreSQL also gets its zone). A connection is used by one thread at a time;
+// Pool lends connections to many.
 import "std"
 
 namespace db {
@@ -142,6 +146,17 @@ namespace db {
             if (v is Bytes) { return v as Bytes; }
             if (v == null) { return new Bytes(); }
             return Bytes.fromString(self.getString(name));
+        }
+        // Column `name` as a DateTime (null for NULL): a date or time column comes
+        // out as one already; text such as "2024-02-28 09:30:15" is parsed (see
+        // DateTime.parse). ValueError for a value that is not a date.
+        fn getDateTime(name: string) -> DateTime {
+            let v = self.get(name);
+            if (v == null) { return null; }
+            if (v is DateTime) { return v as DateTime; }
+            let d = v is string ? DateTime.tryParse(v as string) : null;
+            if (d == null) { throw new ValueError("column '" + name + "' is not a date: " + self.getString(name)); }
+            return d;
         }
         // The row as a map from column name to value.
         fn toMap() -> HashMap<string, any> {

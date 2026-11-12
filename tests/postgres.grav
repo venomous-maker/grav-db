@@ -46,7 +46,7 @@ test "values in and out, NULL and bytea" {
     let rows = db.query("SELECT id, email, age, score, active, role, note, price, born, tags, meta FROM gdb_users ORDER BY id")
     assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,role,note,price,born,tags,meta")
     assertEq(rows.get(0).toString(), "{id: 1, email: \"ada@example.com\", age: 36, score: 9.5, active: true, role: 2, " +
-                                     "note: \"it's \"quoted\" \\ ünï\", price: \"19.99\", born: \"1815-12-10\", " +
+                                     "note: \"it's \"quoted\" \\ ünï\", price: \"19.99\", born: 1815-12-10 00:00:00, " +
                                      "tags: \"{math,engines}\", meta: \"{\"lang\": \"grav\"}\"}")
     assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, role: NULL, " +
                                      "note: NULL, price: NULL, born: NULL, tags: NULL, meta: NULL}")
@@ -201,4 +201,22 @@ test "a pool shared by threads" {
         c.exec("DROP TABLE gdb_hits")
     })
     pool.close()
+}
+
+test "dates and times come out as DateTime" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_t; CREATE TABLE gdb_t (id INT PRIMARY KEY, d DATE, ts TIMESTAMP, tz TIMESTAMPTZ, t TIME, inf TIMESTAMP)")
+    let when = DateTime.parse("2024-02-28 09:30:15.123456")
+    db.execute("INSERT INTO gdb_t VALUES (1, ?, ?, ?, ?, 'infinity')", [DateTime.parse("2024-02-28"), when, when, "12:34:56"])
+    let r = db.queryOne("SELECT d, ts, tz, t, inf FROM gdb_t")
+    assertEq("${r.get("d")} | ${r.get("ts")} | ${r.get("tz")} | ${r.get("t")} | ${r.get("inf")}",
+             "2024-02-28 00:00:00 | 2024-02-28 09:30:15.123456 | 2024-02-28 09:30:15.123456 | 12:34:56 | infinity")
+    assertEq(r.get("tz") is DateTime && r.get("t") is string && r.get("inf") is string, true)
+    assertEq(r.getDateTime("tz") == when, true)                               // (the zone made it exact)
+    db.exec("SET TIME ZONE 'UTC'")                                            // (another session zone: the same moment)
+    assertEq(db.queryOne("SELECT tz FROM gdb_t").getDateTime("tz") == when, true)
+    assertEq(db.queryValue("SELECT id FROM gdb_t WHERE tz = ?", [when]) as long, 1 as long)
+    db.exec("DROP TABLE gdb_t")
+    db.close()
 }

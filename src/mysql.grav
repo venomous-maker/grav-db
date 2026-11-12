@@ -345,7 +345,13 @@ namespace db {
     static int grav_my_is_binary(const grav_my_field* f) {
         return f->charsetnr == 63 && ((f->type >= 249 && f->type <= 255) || f->type == 15);
     }
-    /* Writes a row's n values to out[0..n). A binary string is left null and
+    /* 1 for a binary string, 2 for a DATE, DATETIME or TIMESTAMP (made a
+       DateTime), else 0. */
+    static int grav_my_kind(const grav_my_field* f) {
+        if (grav_my_is_binary(f)) return 1;
+        return f->type == 7 || f->type == 10 || f->type == 12 || f->type == 14 ? 2 : 0;
+    }
+    /* Writes a row's n values to out[0..n). A binary string or a date is left null and
        counted: the caller makes its Bytes. Returns how many there were. */
     static int grav_my_fill(const grav_my_field* f, int n, char** row, const unsigned long* lens, GravAny* out) {
         int bins = 0;
@@ -374,7 +380,7 @@ namespace db {
                 }
                 case 6: break;
                 default:
-                    if (grav_my_is_binary(&f[i])) { bins++; break; }
+                    if (grav_my_kind(&f[i])) { bins++; break; }
                     a.tag = GRAV_ANY_STR;
                     a.v.s = grav_my_copy(p, (long)lens[i]);
             }
@@ -744,13 +750,16 @@ namespace db {
                 if (i >= want) { break; }
                 let a = args[i];
                 i += 1;
+                let at = i - 1;
                 if (rc == -1 && a is Bytes) {
                     let b = a as Bytes;
                     let p = b.rawData();
                     let n = b.size();
-                    let at = i - 1;
                     %{ grav_my_blob((grav_my_stmt*)h, at, (const unsigned char*)p, (size_t)n); %};
                     rc = 0;
+                } else if (rc == -1 && a is DateTime) {
+                    let text: any = (a as DateTime).toString();
+                    rc = %{ grav_my_arg((grav_my_stmt*)h, at, text) %} as int;
                 }
                 if (rc != 0) {
                     %{ ((grav_my_stmt*)h)->len = 0; ((grav_my_stmt*)h)->from = 0; %};
@@ -808,7 +817,8 @@ namespace db {
             }
             return self.cols;
         }
-        // Appends a row's n values to `vals` (filled in C; binary strings become Bytes here).
+        // Appends a row's n values to `vals` (filled in C; binary strings become
+        // Bytes here, and dates DateTimes).
         private fn fill(vals: Array<any>, n: int, f: byte*, row: byte*, lens: byte*) {
             let at = vals.size();
             vals.reserve(at + n);
@@ -816,9 +826,17 @@ namespace db {
             %{ vals->len += n; %};
             if (bins == 0) { return; }
             for (i in 0..n) {
-                if (%{ ((char**)row)[i] == 0 || !grav_my_is_binary(&((grav_my_field*)f)[i]) %} as bool) { continue; }
-                let b = new Bytes();
+                let kind = %{ ((char**)row)[i] == 0 ? 0 : grav_my_kind(&((grav_my_field*)f)[i]) %} as int;
+                if (kind == 0) { continue; }
                 let len = %{ (int)((unsigned long*)lens)[i] %} as int;
+                if (kind == 2) {
+                    let secs = 0 as long;
+                    let us = 0;
+                    if (%{ grav_dt_iso(((char**)row)[i], &secs, &us) %} as bool) { vals.set(at + i, DateTime.fromUnix(secs, us)); }
+                    else { vals.set(at + i, %{ grav_my_copy(((char**)row)[i], len) %} as string); }   // (0000-00-00)
+                    continue;
+                }
+                let b = new Bytes();
                 if (len > 0) { b.appendRaw(%{ (unsigned char*)((char**)row)[i] %} as byte*, len); }
                 vals.set(at + i, b);
             }

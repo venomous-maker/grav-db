@@ -181,3 +181,16 @@ test "executeMany in one transaction" {
     assertEq(failed && db.queryValue("SELECT COUNT(*) FROM m") as long == 1000 as long, true)
     assertEq(db.inTransaction(), false)
 }
+
+test "columns declared DATE, DATETIME or TIMESTAMP give DateTimes" {
+    if (!Sqlite.available()) { return }
+    let db = Sqlite.open(":memory:")
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP, s TEXT, n DATETIME)")
+    let when = DateTime.parse("2024-02-28 09:30:15.123456")
+    db.execute("INSERT INTO t VALUES (1, ?, ?, ?, ?, 'not a date')", [DateTime.parse("2024-02-28"), when, when, when])
+    let r = db.queryOne("SELECT d, dt, ts, s, n FROM t")
+    assertEq("${r.get("d")} | ${r.get("dt")} | ${r.get("ts")} | ${r.get("s")} | ${r.get("n")}",
+             "2024-02-28 00:00:00 | 2024-02-28 09:30:15.123456 | 2024-02-28 09:30:15.123456 | 2024-02-28 09:30:15.123456 | not a date")
+    assertEq(r.get("dt") is DateTime && r.get("s") is string && r.getDateTime("s") == when, true)
+    assertEq(db.queryValue("SELECT id FROM t WHERE dt = ?", [when]) as long, 1 as long)
+}

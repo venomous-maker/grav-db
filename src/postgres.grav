@@ -385,7 +385,7 @@ namespace db {
                     }
                     case 700: case 701: a.tag = GRAV_ANY_FLOAT; a.v.f = strtod(p, 0); break;
                     case 16: a.tag = GRAV_ANY_BOOL; a.v.b = *p == 't'; break;
-                    case 17: bins++; break;
+                    case 17: case 1082: case 1114: case 1184: bins++; break;   /* bytea; date, timestamp, timestamptz */
                     default: a.tag = GRAV_ANY_STR; a.v.s = grav_pg_copy(p, grav_pg.getlength(r, row, i));
                 }
             }
@@ -572,6 +572,7 @@ namespace db {
         private cols: Columns
         private closed: bool
         private last: Row                         // (for insert)
+        private keep: Array<any>                  // this run's argument texts made here (DateTimes)
 
         constructor(sql: string, h: byte*) {
             super(sql);
@@ -579,6 +580,7 @@ namespace db {
             self.cols = null;
             self.closed = false;
             self.last = null;
+            self.keep = new Array<any>();
         }
         destructor() {
             let h = self.h;
@@ -684,6 +686,7 @@ namespace db {
         // Sets `args` (their count must match the placeholders).
         private fn bind(args: Array<any>) {
             let h = self.h;
+            self.keep.clear();
             let want = %{ ((grav_pg_stmt*)h)->n %} as int;
             if (args.size() != want) {
                 throw new DbError("the SQL has ${want} placeholder(s) but ${args.size()} argument(s) were given", 0, self.sql);
@@ -698,6 +701,14 @@ namespace db {
                     let p = b.rawData();
                     let n = b.size();
                     %{ grav_pg_bytes((grav_pg_stmt*)h, i, (const unsigned char*)p, n); %};
+                    i += 1;
+                    continue;
+                }
+                if (a is DateTime) {                          // its local time and zone: exact for timestamptz
+                    let d = a as DateTime;
+                    let text: any = d.toString() + d.format("%z");
+                    self.keep.push(text);                      // (libpq reads it when the statement runs)
+                    %{ grav_pg_arg((grav_pg_stmt*)h, i, text); %};
                     i += 1;
                     continue;
                 }
@@ -752,7 +763,15 @@ namespace db {
             %{ vals->len += n; %};
             if (bins == 0) { return; }
             for (i in 0..n) {
-                if (%{ grav_pg.ftype(r, i) != 17 || grav_pg.getisnull(r, row, i) %} as bool) { continue; }
+                let kind = %{ grav_pg.getisnull(r, row, i) ? 0 : grav_pg.ftype(r, i) %} as int;
+                if (kind == 1082 || kind == 1114 || kind == 1184) {
+                    let secs = 0 as long;
+                    let us = 0;
+                    if (%{ grav_dt_iso(grav_pg.getvalue(r, row, i), &secs, &us) %} as bool) { vals.set(at + i, DateTime.fromUnix(secs, us)); }
+                    else { vals.set(at + i, %{ grav_pg_copy(grav_pg.getvalue(r, row, i), grav_pg.getlength(r, row, i)) %} as string); }   // (infinity, BC)
+                    continue;
+                }
+                if (kind != 17) { continue; }
                 let p: byte* = null;
                 let len = %{ grav_pg_unhex(r, row, i, (unsigned char**)&p) %} as int;
                 let b = new Bytes();
