@@ -20,6 +20,7 @@ import "database.grav"
 namespace db {
 
     %{
+    #include <ctype.h>
     #include <dlfcn.h>
     #include <limits.h>
     #include <math.h>
@@ -27,6 +28,7 @@ namespace db {
     #include <stdio.h>
     #include <stdlib.h>
     #include <string.h>
+    #include <strings.h>
     /* MYSQL_FIELD: the same in libmariadb and libmysqlclient. */
     typedef struct {
         char *name, *org_name, *table, *org_table, *db, *catalog, *def;
@@ -42,6 +44,7 @@ namespace db {
         int (*options)(void*, int, const void*);
         int (*real_query)(void*, const char*, unsigned long);
         void* (*store_result)(void*);
+        void* (*use_result)(void*);
         char** (*fetch_row)(void*);
         unsigned long* (*fetch_lengths)(void*);
         grav_my_field* (*fetch_fields)(void*);
@@ -55,6 +58,7 @@ namespace db {
         void (*free_result)(void*);
         const char* (*error)(void*);
         unsigned int (*errnum)(void*);
+        const char* (*sqlstate)(void*);
         void (*close)(void*);
         const char* (*get_client_info)(void);
         const char* (*get_server_info)(void*);
@@ -75,13 +79,14 @@ namespace db {
     #define GRAV_MY_FN(field, name) *(void**)(&grav_my.field) = dlsym(h, name)
         GRAV_MY_FN(init, "mysql_init"); GRAV_MY_FN(real_connect, "mysql_real_connect");
         GRAV_MY_FN(options, "mysql_options"); GRAV_MY_FN(real_query, "mysql_real_query");
-        GRAV_MY_FN(store_result, "mysql_store_result"); GRAV_MY_FN(fetch_row, "mysql_fetch_row");
+        GRAV_MY_FN(store_result, "mysql_store_result"); GRAV_MY_FN(use_result, "mysql_use_result");
+        GRAV_MY_FN(fetch_row, "mysql_fetch_row");
         GRAV_MY_FN(fetch_lengths, "mysql_fetch_lengths"); GRAV_MY_FN(fetch_fields, "mysql_fetch_fields");
         GRAV_MY_FN(num_fields, "mysql_num_fields"); GRAV_MY_FN(num_rows, "mysql_num_rows");
         GRAV_MY_FN(field_count, "mysql_field_count"); GRAV_MY_FN(affected_rows, "mysql_affected_rows");
         GRAV_MY_FN(insert_id, "mysql_insert_id"); GRAV_MY_FN(next_result, "mysql_next_result");
         GRAV_MY_FN(more_results, "mysql_more_results"); GRAV_MY_FN(free_result, "mysql_free_result");
-        GRAV_MY_FN(error, "mysql_error"); GRAV_MY_FN(errnum, "mysql_errno"); GRAV_MY_FN(close, "mysql_close");
+        GRAV_MY_FN(error, "mysql_error"); GRAV_MY_FN(errnum, "mysql_errno"); GRAV_MY_FN(sqlstate, "mysql_sqlstate"); GRAV_MY_FN(close, "mysql_close");
         GRAV_MY_FN(get_client_info, "mysql_get_client_info"); GRAV_MY_FN(get_server_info, "mysql_get_server_info");
         GRAV_MY_FN(ping, "mysql_ping"); GRAV_MY_FN(real_escape_string, "mysql_real_escape_string");
         GRAV_MY_FN(library_init, "mysql_library_init");
@@ -156,6 +161,7 @@ namespace db {
         grav_my_conn* c;
         const char* sql;
         size_t sqllen, from, len, cap;
+        long lp, rp;                                   /* an INSERT's one tuple of `?`s, for executeMany (-1: none) */
         int n;
         int* pos;
         char* buf;
@@ -185,6 +191,49 @@ namespace db {
         *out = pos;
         return k;
     }
+    static int grav_my_word(const char* s, size_t n, size_t i, const char* w) {   /* w (upper case) as a whole word at s[i] */
+        size_t k = strlen(w);
+        if (i + k > n || strncasecmp(s + i, w, k)) return 0;
+        int before = i > 0 && (isalnum((unsigned char)s[i - 1]) || s[i - 1] == '_' || s[i - 1] == '$');
+        int after = i + k < n && (isalnum((unsigned char)s[i + k]) || s[i + k] == '_' || s[i + k] == '$');
+        return !before && !after;
+    }
+    /* For an INSERT or REPLACE whose `?`s are all in the one tuple after VALUES,
+       where that tuple's parentheses are: executeMany repeats it. */
+    static void grav_my_tuple(grav_my_stmt* h) {
+        const char* s = h->sql;
+        size_t n = h->sqllen, i = 0;
+        h->lp = h->rp = -1;
+        if (h->n == 0) return;
+        while (i < n && isspace((unsigned char)s[i])) i++;
+        if (!grav_my_word(s, n, i, "INSERT") && !grav_my_word(s, n, i, "REPLACE")) return;
+        long lp = -1, rp = -1;
+        int depth = 0, values = 0;
+        for (; i < n && rp < 0; i++) {
+            char ch = s[i];
+            if (ch == '\'' || ch == '"' || ch == '`') {
+                for (i++; i < n; i++) {
+                    if (s[i] == '\\' && ch != '`') { i++; continue; }
+                    if (s[i] == ch) { if (i + 1 < n && s[i + 1] == ch) { i++; continue; } break; }
+                }
+            } else if (ch == '#' || (ch == '-' && i + 2 < n && s[i + 1] == '-' && isspace((unsigned char)s[i + 2]))) {
+                while (i < n && s[i] != '\n') i++;
+            } else if (ch == '/' && i + 1 < n && s[i + 1] == '*') {
+                for (i += 2; i + 1 < n && !(s[i] == '*' && s[i + 1] == '/'); i++) {}
+                i++;
+            } else if (ch == '(') {
+                if (values && depth == 0) { if (lp >= 0) return; lp = (long)i; }
+                depth++;
+            } else if (ch == ')') {
+                if (--depth == 0 && lp >= 0) rp = (long)i;
+            } else if (!values && depth == 0 && (grav_my_word(s, n, i, "VALUES") || grav_my_word(s, n, i, "VALUE"))) {
+                values = 1;
+                i += grav_my_word(s, n, i, "VALUES") ? 5 : 4;   /* (to the word's last letter) */
+            } else if (values && lp < 0 && !isspace((unsigned char)ch)) return;
+        }
+        if (rp < 0 || h->pos[0] < lp || h->pos[h->n - 1] > rp) return;
+        h->lp = lp; h->rp = rp;
+    }
     static grav_my_stmt* grav_my_stmt_new(grav_my_conn* c, const char* sql) {
         grav_my_stmt* h = (grav_my_stmt*)calloc(1, sizeof *h);
         if (!h) abort();
@@ -193,6 +242,7 @@ namespace db {
         h->sql = sql;
         h->sqllen = grav_str_len(sql);
         h->n = grav_my_scan(sql, h->sqllen, &h->pos);
+        grav_my_tuple(h);
         return h;
     }
     static void grav_my_stmt_free(grav_my_stmt* h) { grav_my_conn_unref(h->c); free(h->pos); free(h->buf); free(h); }
@@ -247,6 +297,13 @@ namespace db {
         grav_my_put(h, tmp, (size_t)k);
         return 0;
     }
+    /* Writes a[from..n): n when all are written, else the index of the first
+       that is not a scalar or fails (*rc: -1 or -2, as grav_my_arg). */
+    static int grav_my_args(grav_my_stmt* h, const GravAny* a, int from, int n, int* rc) {
+        for (int i = from; i < n; i++) { int r = grav_my_arg(h, i, a[i]); if (r) { *rc = r; return i; } }
+        *rc = 0;
+        return n;
+    }
     static void grav_my_blob(grav_my_stmt* h, int i, const unsigned char* p, size_t n) {
         static const char hex[] = "0123456789ABCDEF";
         grav_my_seg(h, i);
@@ -256,6 +313,24 @@ namespace db {
         for (size_t j = 0; j < n; j++) { *o++ = hex[p[j] >> 4]; *o++ = hex[p[j] & 15]; }
         *o++ = '\'';
         h->len = (size_t)(o - h->buf);
+    }
+    /* executeMany: starts a row's copy of the tuple (the INSERT's head first,
+       then ", (" for the rest), and ends it. */
+    static void grav_my_row_start(grav_my_stmt* h, int first) {
+        if (first) { h->len = 0; h->from = 0; return; }
+        grav_my_put(h, ",", 1);
+        h->from = (size_t)h->lp;
+    }
+    static void grav_my_row_end(grav_my_stmt* h) {
+        grav_my_put(h, h->sql + h->from, (size_t)h->rp + 1 - h->from);
+        h->from = (size_t)h->rp + 1;
+    }
+    /* Sends the rows written since the last send, with the rest of the SQL. */
+    static int grav_my_send_many(grav_my_stmt* h) {
+        grav_my_put(h, h->sql + h->from, h->sqllen - h->from);
+        int rc = grav_my.real_query(h->c->m, h->buf, (unsigned long)h->len);
+        h->len = 0; h->from = 0;
+        return rc;
     }
     /* Sends the statement (with the arguments written since the last send). */
     static int grav_my_send(grav_my_stmt* h) {
@@ -426,6 +501,12 @@ namespace db {
             }
             return o;
         }
+        // The connection's last error, as a DbError for `sql`.
+        static fn error(m: byte*, sql: string) -> DbError {
+            let e = new DbError(%{ grav_my_copy(grav_my.error(m), -1) %} as string, %{ (int)grav_my.errnum(m) %} as int, sql);
+            e.state = %{ grav_my_copy(grav_my.sqlstate(m), -1) %} as string;
+            return e;
+        }
         private static fn unescape(s: string) -> string { return %{ grav_my_unescape(s) %} as string; }
         private static fn need() {
             if (!MySql.available()) { throw new StateError("MySQL is not available: no libmariadb or libmysqlclient could be loaded"); }
@@ -436,6 +517,7 @@ namespace db {
     class MySqlConnection extends Connection {
         private c: byte*                         // grav_my_conn*
         private cache: HashMap<string, MySqlStatement>
+        private recent: Array<MySqlStatement>    // 16 of the cached, by their SQL string's address (no hashing)
         private openFlag: bool
         // Where it is connected ("mysql://app@localhost:3306/shop").
         public url: string
@@ -445,6 +527,8 @@ namespace db {
             self.c = c;
             self.url = url;
             self.cache = new HashMap<string, MySqlStatement>();
+            self.recent = new Array<MySqlStatement>(16);
+            for (i in 0..16) { self.recent.push(null); }
             self.openFlag = true;
         }
         destructor() {
@@ -482,6 +566,7 @@ namespace db {
             self.openFlag = false;
             for (st in self.cache.values()) { st.close(); }
             self.cache.clear();
+            for (i in 0..16) { self.recent[i] = null; }
             let c = self.c;
             %{ grav_my_conn_close((grav_my_conn*)c); %};
         }
@@ -489,26 +574,32 @@ namespace db {
         // The cached statement for `sql` (a statement is safe to run again inside
         // its own each(): its rows are read before they are handed out).
         protected fn borrow(sql: string) -> Statement {
-            let st = self.cache.getOr(sql, null);
+            let slot = %{ (int)(((unsigned long)sql >> 4) & 15) %} as int;
+            let st = self.recent[slot];
+            if (st != null) { let had = st.sql; if (%{ had == sql %} as bool) { return st; } }   // (the very string: same SQL)
+            st = self.cache.getOr(sql, null);
             if (st == null) {
-                if (self.cache.size() >= 256) { self.cache.clear(); }   // (one still running keeps working)
+                if (self.cache.size() >= 256) { self.cache.clear(); for (i in 0..16) { self.recent[i] = null; } }   // (one still running keeps working)
                 st = self.make(sql);
                 self.cache.put(sql, st);
             }
+            self.recent[slot] = st;
             return st;
         }
         protected fn done(st: Statement) {}
         protected fn beginSql() -> string { return "START TRANSACTION"; }
+        // An INSERT's rows go as multi-row INSERTs; other statements one by one.
+        protected fn batch(sql: string, rows: Array<Array<any>>) -> long {
+            let st = self.borrow(sql) as MySqlStatement;
+            return st.repeatable() ? st.many(rows) : super.batch(sql, rows);
+        }
 
         private fn make(sql: string) -> MySqlStatement {
             self.handle();
             let c = self.c;
             return new MySqlStatement(sql, %{ grav_my_stmt_new((grav_my_conn*)c, sql) %} as byte*);
         }
-        private fn error(sql: string) -> DbError {
-            let m = self.handle();
-            return new DbError(%{ grav_my_copy(grav_my.error(m), -1) %} as string, %{ (int)grav_my.errnum(m) %} as int, sql);
-        }
+        private fn error(sql: string) -> DbError { return MySql.error(self.handle(), sql); }
         private fn handle() -> byte* {
             if (!self.openFlag) { throw new StateError("the MySQL connection to " + self.url + " is closed"); }
             let c = self.c;
@@ -543,14 +634,15 @@ namespace db {
             self.drain(m);
             return n;
         }
+        // (query and queryOne read rows straight off the connection as they fill
+        // them; no user code runs until the result is done.)
         fn query(args: Array<any>) -> ResultSet {
             let m = self.send(args);
-            let r = self.result(m);
+            let r = self.stream(m);
             if (r == null) { return new ResultSet(new Columns(new Array<string>()), new Array<any>(), 0); }
             let cols = self.columns(r);
             let n = cols.size();
-            let rows = %{ (int)grav_my.num_rows(r) %} as int;
-            let vals = new Array<any>(rows * n);
+            let vals = new Array<any>(64 * n);
             let f = %{ grav_my.fetch_fields(r) %} as byte*;
             let count = 0;
             let row = %{ grav_my.fetch_row(r) %} as byte*;
@@ -559,20 +651,23 @@ namespace db {
                 count += 1;
                 row = %{ grav_my.fetch_row(r) %} as byte*;
             }
-            %{ grav_my.free_result(r); %};
+            self.finish(m, r);
             return new ResultSet(cols, vals, count);
         }
         fn queryOne(args: Array<any>) -> Row {
             let m = self.send(args);
-            let r = self.result(m);
+            let r = self.stream(m);
             if (r == null) { return null; }
             let row = %{ grav_my.fetch_row(r) %} as byte*;
-            if (row == null) { %{ grav_my.free_result(r); %}; return null; }
-            let cols = self.columns(r);
-            let vals = new Array<any>(cols.size());
-            self.fill(vals, cols.size(), %{ grav_my.fetch_fields(r) %} as byte*, row, %{ grav_my.fetch_lengths(r) %} as byte*);
-            %{ grav_my.free_result(r); %};
-            return new Row(cols, vals, 0);
+            let out: Row = null;
+            if (row != null) {
+                let cols = self.columns(r);
+                let vals = new Array<any>(cols.size());
+                self.fill(vals, cols.size(), %{ grav_my.fetch_fields(r) %} as byte*, row, %{ grav_my.fetch_lengths(r) %} as byte*);
+                out = new Row(cols, vals, 0);
+            }
+            self.finish(m, r);
+            return out;
         }
         fn each(args: Array<any>, f: fn(Row)) {
             let m = self.send(args);
@@ -592,29 +687,74 @@ namespace db {
         }
         fn close() { self.closed = true; }
 
-        // Writes `args` into the SQL (their count must match the `?`s) and sends
-        // it; the connection's MYSQL*.
+        // Whether executeMany can send its rows as one INSERT (its `?`s are all in
+        // the one tuple after VALUES).
+        fn repeatable() -> bool { let h = self.h; return %{ ((grav_my_stmt*)h)->lp >= 0 %} as bool; }
+        // Runs it with each of `rows` as multi-row INSERTs of up to 512 KiB each
+        // (see repeatable).
+        fn many(rows: Array<Array<any>>) -> long {
+            let m = self.connection();
+            let h = self.h;
+            let total = 0 as long;
+            let inChunk = 0;
+            for (row in rows) {
+                %{ grav_my_row_start((grav_my_stmt*)h, inChunk == 0); %};
+                self.write(row);
+                %{ grav_my_row_end((grav_my_stmt*)h); %};
+                inChunk += 1;
+                if (%{ ((grav_my_stmt*)h)->len %} as int >= 524288) { total += self.sendMany(m); inChunk = 0; }
+            }
+            if (inChunk > 0) { total += self.sendMany(m); }
+            return total;
+        }
+        private fn sendMany(m: byte*) -> long {
+            let h = self.h;
+            if (%{ grav_my_send_many((grav_my_stmt*)h) %} as int != 0) { throw self.error(m); }
+            let n = %{ ({ void* r = grav_my.store_result(m); if (r) grav_my.free_result(r); (long long)grav_my.affected_rows(m); }) %} as long;
+            self.drain(m);
+            return n;
+        }
+
+        // Writes `args` into the SQL and sends it; the connection's MYSQL*.
         private fn send(args: Array<any>) -> byte* {
+            let m = self.connection();
+            let h = self.h;
+            self.write(args);
+            if (%{ grav_my_send((grav_my_stmt*)h) %} as int != 0) { throw self.error(m); }
+            return m;
+        }
+        private fn connection() -> byte* {
             if (self.closed) { throw new StateError("the statement is closed: " + self.sql); }
             let h = self.h;
             let m = %{ ((grav_my_stmt*)h)->c->m %} as byte*;
             if (m == null) { throw new StateError("the statement's MySQL connection is closed: " + self.sql); }
+            return m;
+        }
+        // Writes `args` in place of the `?`s (their count must match).
+        private fn write(args: Array<any>) {
+            let h = self.h;
             let want = %{ ((grav_my_stmt*)h)->n %} as int;
             if (args.size() != want) {
                 throw new DbError("the SQL has ${want} placeholder(s) but ${args.size()} argument(s) were given", 0, self.sql);
             }
-            for (i, a in args) {
-                let rc = %{ grav_my_arg((grav_my_stmt*)h, i, a) %} as int;   // scalars in one call
+            let i = 0;
+            while (i < want) {
+                let rc = 0;
+                i = %{ grav_my_args((grav_my_stmt*)h, (const GravAny*)args->data, i, want, &rc) %} as int;   // the scalars, in C
+                if (i >= want) { break; }
+                let a = args[i];
+                i += 1;
                 if (rc == -1 && a is Bytes) {
                     let b = a as Bytes;
                     let p = b.rawData();
                     let n = b.size();
-                    %{ grav_my_blob((grav_my_stmt*)h, i, (const unsigned char*)p, (size_t)n); %};
+                    let at = i - 1;
+                    %{ grav_my_blob((grav_my_stmt*)h, at, (const unsigned char*)p, (size_t)n); %};
                     rc = 0;
                 }
                 if (rc != 0) {
                     %{ ((grav_my_stmt*)h)->len = 0; ((grav_my_stmt*)h)->from = 0; %};
-                    let k = i + 1;
+                    let k = i;
                     if (rc == -2) { throw new DbError("argument ${k} is NaN or infinite: MySQL has no such numbers", 0, self.sql); }
                     let t = typename(a);                        // "std.collections.Array$int" -> "Array"
                     let dot = Str.lastIndexOf(t, ".");
@@ -625,8 +765,6 @@ namespace db {
                                       ": SQL takes numbers, bools, strings, Bytes and null", 0, self.sql);
                 }
             }
-            if (%{ grav_my_send((grav_my_stmt*)h) %} as int != 0) { throw self.error(m); }
-            return m;
         }
         // The first result's rows (all read), or null when the statement has none;
         // later results are dropped.
@@ -642,10 +780,24 @@ namespace db {
             }
             return r;
         }
-        private fn drain(m: byte*) { if (%{ grav_my_drain(m) %} as int != 0) { throw self.error(m); } }
-        private fn error(m: byte*) -> DbError {
-            return new DbError(%{ grav_my_copy(grav_my.error(m), -1) %} as string, %{ (int)grav_my.errnum(m) %} as int, self.sql);
+        // The first result, to be read row by row, or null when there is none.
+        private fn stream(m: byte*) -> byte* {
+            let r = %{ grav_my.use_result(m) %} as byte*;
+            if (r == null) {
+                if (%{ grav_my.field_count(m) %} as int > 0) { throw self.error(m); }
+                self.drain(m);
+            }
+            return r;
         }
+        // Ends a streamed result: the rest of its rows (and any later results) are
+        // read and dropped; an error part way through is thrown.
+        private fn finish(m: byte*, r: byte*) {
+            let code = %{ ({ unsigned int e = grav_my.errnum(m); grav_my.free_result(r); e; }) %} as int;
+            if (code != 0) { throw self.error(m); }
+            self.drain(m);
+        }
+        private fn drain(m: byte*) { if (%{ grav_my_drain(m) %} as int != 0) { throw self.error(m); } }
+        private fn error(m: byte*) -> DbError { return MySql.error(m, self.sql); }
         private fn columns(r: byte*) -> Columns {
             let n = %{ (int)grav_my.num_fields(r) %} as int;
             let f = %{ grav_my.fetch_fields(r) %} as byte*;

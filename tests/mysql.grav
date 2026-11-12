@@ -184,3 +184,38 @@ test "a pool shared by threads" {
     })
     pool.close()
 }
+
+test "executeMany: one multi-row INSERT, or row by row" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_m; CREATE TABLE gdb_m (id INT PRIMARY KEY, name VARCHAR(20), b BLOB) ENGINE=InnoDB")
+    let rows = new Array<Array<any>>()
+    for (i in 0..20000) {
+        let b: any = i % 3 == 0 ? null : Bytes.fromHex("00ff27")
+        rows.push([i, "n'${i}", b])
+    }
+    let sql = "INSERT INTO gdb_m (id, name, b) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name)"
+    let kinds = new Array<string>()
+    for (q in [sql, "insert into t value (?)", "REPLACE INTO t (`values`) VALUES (?, 'VALUES (')", "INSERT INTO t VALUES (?), (?)",
+               "INSERT INTO t SELECT ?", "UPDATE t SET a = ?"]) {
+        kinds.push("${(db.prepare(q) as MySqlStatement).repeatable()}")
+    }
+    assertEq(Str.join(kinds, " "), "true true true false false false")
+    assertEq(db.executeMany(sql, rows), 20000 as long)
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_m WHERE b IS NULL") as long, 6667 as long)
+    let last = db.queryOne("SELECT name, b FROM gdb_m WHERE id = 19999")
+    assertEq(last.getString("name") + " " + last.getBytes("b").toHex(), "n'19999 00ff27")
+    // Not an INSERT of one tuple: row by row.
+    let more = new Array<Array<any>>()
+    more.push(["a", 1]); more.push(["b", 2]); more.push(["c", 99999])
+    assertEq(db.executeMany("UPDATE gdb_m SET name = ? WHERE id = ?", more), 2 as long)
+    // A failing row undoes them all.
+    let bad = new Array<Array<any>>()
+    bad.push([50000, "x"]); bad.push([1, "dup"])
+    let failed = ""
+    try { db.executeMany("INSERT INTO gdb_m (id, name) VALUES (?, ?)", bad) } catch (e: DbError) { failed = "${e.code} ${e.state}" }
+    assertEq(failed, "1062 23000")
+    assertEq(db.queryValue("SELECT COUNT(*) FROM gdb_m WHERE id = 50000") as long, 0 as long)
+    db.exec("DROP TABLE gdb_m")
+    db.close()
+}
