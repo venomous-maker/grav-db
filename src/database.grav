@@ -1,5 +1,5 @@
-// database.grav — what every grav-db driver offers (SQLite today; MySQL/MariaDB
-// and PostgreSQL next): connections, statements with `?` placeholders, results,
+// database.grav — what every grav-db driver offers (SQLite, MySQL/MariaDB and
+// PostgreSQL): connections, statements with `?` placeholders, results,
 // transactions, and a pool that shares connections between threads.
 //
 //   let db = Sqlite.open("app.db")
@@ -17,15 +17,33 @@ import "std"
 
 namespace db {
 
+    %{
+    #include <string.h>
+    /* The first of names[0..n) equal to `name`, or -1: for a few columns, a scan
+       is quicker than hashing. */
+    static int grav_db_find(const char* const* names, int n, const char* name) {
+        size_t len = grav_str_len(name);
+        for (int i = 0; i < n; i++) {
+            const char* c = names[i];
+            if (c == name || (grav_str_len(c) == len && !memcmp(c, name, len))) return i;
+        }
+        return -1;
+    }
+    %}
+
     // A database failure: SQL the database rejects, a constraint it enforces, a
     // lost connection. `code` is the driver's own number for it (SQLite's
-    // extended result code, MySQL's errno, ...), `sql` the statement involved.
+    // extended result code, MySQL's errno; 0 from PostgreSQL), `state` the
+    // SQLSTATE when the database gives one ("23505", "42P01"; "" otherwise),
+    // `sql` the statement involved.
     class DbError extends Exception {
         public code: int
+        public state: string
         public sql: string
         constructor(m: string, code: int, sql: string) {
             super(m);
             self.code = code;
+            self.state = "";
             self.sql = sql;
         }
         // "DbError".
@@ -42,7 +60,12 @@ namespace db {
             for (i, n in names) { if (!self.index.containsKey(n)) { self.index.put(n, i); } }
         }
         // The position of column `name`, or -1.
-        fn find(name: string) -> int { return self.index.getOr(name, -1); }
+        fn find(name: string) -> int {
+            let names = self.names;
+            let n = names.size();
+            if (n <= 16) { return %{ grav_db_find((const char* const*)names->data, n, name) %} as int; }
+            return self.index.getOr(name, -1);
+        }
         fn size() -> int { return self.names.size(); }
     }
 
@@ -241,6 +264,26 @@ namespace db {
         fn execute(sql: string, args: Array<any> = new Array<any>()) -> long {
             let st = self.borrow(sql);
             try { let n = st.run(args); self.done(st); return n; } catch (e: Exception) { self.done(st); throw e; }
+        }
+        // Runs `sql` once for each list of arguments in `rows`, all in one
+        // transaction (a savepoint inside one), so either every row goes in or
+        // none does; the number of rows changed. Drivers batch the runs: MySQL
+        // sends an INSERT's rows as one multi-row INSERT, PostgreSQL pipelines them.
+        fn executeMany(sql: string, rows: Array<Array<any>>) -> long {
+            if (rows.size() == 0) { return 0; }
+            self.begin();
+            let n = 0 as long;
+            try { n = self.batch(sql, rows); } catch (e: Exception) { self.rollback(); throw e; }
+            self.commit();
+            return n;
+        }
+        // Runs `sql` with each of `rows` (inside executeMany's transaction).
+        protected fn batch(sql: string, rows: Array<Array<any>>) -> long {
+            let st = self.borrow(sql);
+            let n = 0 as long;
+            try { for (r in rows) { n += st.run(r); } } catch (e: Exception) { self.done(st); throw e; }
+            self.done(st);
+            return n;
         }
         // Runs an INSERT with `args`; the new row's id.
         fn insert(sql: string, args: Array<any> = new Array<any>()) -> long {

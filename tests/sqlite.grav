@@ -166,3 +166,18 @@ test "rows into objects through reflection" {
     }
     assertEq(Str.join(out, "; "), "1 ada@example.com 36; 2 bob@example.com null")
 }
+
+test "executeMany in one transaction" {
+    if (!Sqlite.available()) { return }
+    let db = Sqlite.open(":memory:")
+    db.exec("CREATE TABLE m (id INTEGER PRIMARY KEY, name TEXT)")
+    let rows = new Array<Array<any>>()
+    for (i in 0..1000) { rows.push([i, "n${i}"]) }
+    assertEq(db.executeMany("INSERT INTO m VALUES (?, ?)", rows), 1000 as long)
+    let bad = new Array<Array<any>>()
+    bad.push([5000, "x"]); bad.push([1, "dup"])
+    let failed = false
+    try { db.executeMany("INSERT INTO m VALUES (?, ?)", bad) } catch (e: DbError) { failed = true }
+    assertEq(failed && db.queryValue("SELECT COUNT(*) FROM m") as long == 1000 as long, true)
+    assertEq(db.inTransaction(), false)
+}
