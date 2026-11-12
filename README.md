@@ -9,6 +9,9 @@ objects through Grav's reflection (`reflect(User).fields()`).
 
 ## Install
 
+grav-db needs a Grav compiler with microsecond `DateTime`s and reflection that
+creates objects (`ClassInfo.create`), from November 2026 on.
+
 From GitHub:
 
 ```bash
@@ -77,7 +80,9 @@ told otherwise, and talks UTF-8. A connection has `ping()`, `serverVersion()`
 and `changes()`; the server's NOTICEs are not printed.
 
 **Arguments** go in a list, one per `?`: numbers, bools, strings, `Bytes`,
-`null` and `T?` values (an enum goes in as its number). The count must match
+`DateTime`s, `null` and `T?` values (an enum goes in as its number; a
+`DateTime` as its local time, `2024-02-28 09:30:15.250000`, with its zone for
+PostgreSQL so a `timestamptz` gets the exact moment). The count must match
 the placeholders (`DbError` otherwise). PostgreSQL also takes `$1`, `$2`, ...
 written out (not mixed with `?`), and `??` for a literal `?` (jsonb's `?|`);
 it sends the arguments apart from the SQL, untyped so the server infers each
@@ -95,17 +100,35 @@ from where it goes (`Bytes` as bytea), so `SELECT ?` gives text back: write
 
 A `Row` gives `get(name)` (an `any`; `null` for SQL NULL), `at(i)`,
 `isNull(name)`, `getString`, `getInt` (a `long`), `getFloat`, `getBool`,
-`getBytes`, `has(name)`, `columns()` and `toMap()`. A column that is not there
-is a `ValueError`. SQLite values come out as `long` (INTEGER), `float` (REAL),
-`string` (TEXT), `Bytes` (BLOB) and `null`. MySQL values come out as `long`
-(the integer types, YEAR and BIT; a `BIGINT UNSIGNED` above the `long` range
-as a `ulong`), `float` (FLOAT, DOUBLE), `Bytes` (BINARY, VARBINARY and the
-BLOBs), `null`, and `string` for the rest: text, DECIMAL (exact, so it is not
-rounded through a float; `getFloat` converts it, `getInt` a whole one) and dates and
-times. PostgreSQL values come out as `long` (smallint, integer, bigint, oid),
-`float` (real, double precision, including NaN and infinities), `bool`
-(boolean), `Bytes` (bytea), `null`, and `string` for the rest (numeric, text,
-dates and times, json, uuid, arrays in their text form).
+`getBytes`, `getDateTime`, `has(name)`, `columns()` and `toMap()`. A column
+that is not there is a `ValueError`.
+
+**Dates and times** come out as Grav's `DateTime`, to the microsecond: MySQL's
+DATE, DATETIME and TIMESTAMP, PostgreSQL's date, timestamp and timestamptz,
+and SQLite's text in a column declared DATE, DATETIME or TIMESTAMP. A date is
+its local midnight, a time without a zone is local time, and a timestamptz is
+the exact moment whatever the session's zone. What a `DateTime` cannot hold
+stays a string: MySQL's `0000-00-00`, PostgreSQL's `infinity` and BC dates, and
+times of day (TIME) and intervals, which are not moments. `getDateTime(name)`
+also parses a date held as text (`"2024-02-28 09:30"`).
+
+SQLite values come out as `long` (INTEGER), `float` (REAL), `string` (TEXT),
+`Bytes` (BLOB), `DateTime` (see above) and `null`. MySQL values come out as
+`long` (the integer types, YEAR and BIT; a `BIGINT UNSIGNED` above the `long`
+range as a `ulong`), `float` (FLOAT, DOUBLE), `Bytes` (BINARY, VARBINARY and
+the BLOBs), `DateTime`, `null`, and `string` for the rest: text, TIME and
+DECIMAL (exact, so it is not rounded through a float; `getFloat` converts it,
+`getInt` a whole one). PostgreSQL values come out as `long` (smallint,
+integer, bigint, oid), `float` (real, double precision, including NaN and
+infinities), `bool` (boolean), `Bytes` (bytea), `DateTime`, `null`, and
+`string` for the rest (numeric, text, time, interval, json, uuid, arrays in
+their text form).
+
+**Into objects.** Grav's reflection fills a model from a row:
+`reflect(User).create()` makes one and `field.set(user, row.get(col))` stores
+each value, converting where it fits (a DECIMAL's `"42"` into an `int`, MySQL's
+`1` into a `bool`), so a column's type need not match the field's exactly. Inside
+a generic `Repository<T>`, `reflect(T)` is the model class.
 
 **Writing.** `execute(sql, args)` returns the rows changed, `insert(sql, args)`
 the new row's id, `exec(sql)` runs a script of statements without arguments.
