@@ -2,9 +2,9 @@
 
 Databases for [Grav](https://github.com/venomous-maker/grav): connections,
 prepared statements with `?` placeholders, results, transactions with
-savepoints, and a connection pool for threads. The drivers are **SQLite** and
-**MySQL/MariaDB**, with **PostgreSQL** next, behind the same API, so code
-written against one moves to the others. It is the base for an ORM: rows fill
+savepoints, batched inserts, and a connection pool for threads. The drivers
+are **SQLite**, **MySQL/MariaDB** and **PostgreSQL**, behind the same API, so
+code written against one moves to the others. It is the base for an ORM: rows fill
 objects through Grav's reflection (`reflect(User).fields()`).
 
 ## Install
@@ -39,16 +39,18 @@ fn main() {
 }
 ```
 
-For a MySQL or MariaDB server, open a URL instead; the rest is the same:
+For a server, open a URL instead; the rest is the same:
 
 ```grav
-let db = MySql.open("mysql://app:secret@localhost/shop")
+let my = MySql.open("mysql://app:secret@localhost/shop")
+let pg = Postgres.open("postgresql://app:secret@localhost/shop")
 ```
 
-SQLite needs the system's `libsqlite3`, and MySQL a client library
-(`libmariadb`, as in Debian's `libmariadb3`, or `libmysqlclient`). Each is
-loaded when the first connection is made; `Sqlite.available()` and
-`MySql.available()` say whether it could be.
+SQLite needs the system's `libsqlite3`, MySQL a client library (`libmariadb`,
+as in Debian's `libmariadb3`, or `libmysqlclient`) and PostgreSQL `libpq`
+(`libpq5`). Each is loaded when the first connection is made;
+`Sqlite.available()`, `MySql.available()` and `Postgres.available()` say
+whether it could be.
 
 ## The API
 
@@ -67,9 +69,20 @@ Unix socket. `MySql.connect(options)` takes a `MySqlOptions` (`host`, `port`,
 connection talks utf8mb4, has `ping()`, `serverVersion()` and `changes()`, and
 refuses `LOAD DATA LOCAL`.
 
+**Connecting to PostgreSQL.** `Postgres.open(url)` takes
+`postgresql://user:password@host:5432/database` (`postgres://` too), with
+libpq's options in the query (`?sslmode=require`, `?connect_timeout=5`), or
+libpq's `host=... dbname=...` form. It waits 10 s at most for the server unless
+told otherwise, and talks UTF-8. A connection has `ping()`, `serverVersion()`
+and `changes()`; the server's NOTICEs are not printed.
+
 **Arguments** go in a list, one per `?`: numbers, bools, strings, `Bytes`,
 `null` and `T?` values (an enum goes in as its number). The count must match
-the placeholders (`DbError` otherwise).
+the placeholders (`DbError` otherwise). PostgreSQL also takes `$1`, `$2`, ...
+written out (not mixed with `?`), and `??` for a literal `?` (jsonb's `?|`);
+it sends the arguments apart from the SQL, untyped so the server infers each
+from where it goes (`Bytes` as bytea), so `SELECT ?` gives text back: write
+`?::int8` when there is nothing to infer from.
 
 **Reading.**
 
@@ -89,21 +102,38 @@ is a `ValueError`. SQLite values come out as `long` (INTEGER), `float` (REAL),
 as a `ulong`), `float` (FLOAT, DOUBLE), `Bytes` (BINARY, VARBINARY and the
 BLOBs), `null`, and `string` for the rest: text, DECIMAL (exact, so it is not
 rounded through a float; `getFloat` converts it, `getInt` a whole one) and dates and
-times.
+times. PostgreSQL values come out as `long` (smallint, integer, bigint, oid),
+`float` (real, double precision, including NaN and infinities), `bool`
+(boolean), `Bytes` (bytea), `null`, and `string` for the rest (numeric, text,
+dates and times, json, uuid, arrays in their text form).
 
 **Writing.** `execute(sql, args)` returns the rows changed, `insert(sql, args)`
 the new row's id, `exec(sql)` runs a script of statements without arguments.
+PostgreSQL has no last insert id: `insert` returns the first column of the
+first row when the SQL has a `RETURNING` clause (`... RETURNING id`, one round
+trip), else `lastval()` (the last value this session took from a sequence: a
+SERIAL or IDENTITY column).
+
+**Many rows.** `executeMany(sql, rows)` runs `sql` once for each list of
+arguments in `rows`, all in one transaction (a savepoint inside one), so
+either every row goes in or none does; it returns the rows changed. MySQL
+sends an INSERT whose `?`s are in the one tuple after VALUES as multi-row
+INSERTs of up to 512 KiB each; PostgreSQL pipelines the runs, 256 to a round
+trip; SQLite runs its prepared statement in a loop.
 
 **Prepared statements.** `prepare(sql)` parses once; `run(args)`,
 `query(args)`, `queryOne(args)` and `each(args, f)` reuse it; `close()` frees
 it. Connections also keep the statements they run prepared, so repeating the
-same SQL through `query` or `execute` costs no parsing. A MySQL statement finds
+same SQL through `query` or `execute` costs no parsing (a call with the very
+same string, such as a literal, finds its statement without hashing the SQL).
+A PostgreSQL statement is prepared on the server when it first runs, and
+deallocated there when it is closed or drops out of the cache. A MySQL statement finds
 its `?`s once (not those in quotes, backticks or comments) and writes each
 run's arguments into the SQL as escaped literals: strings through the server's
 own escaping for the connection's character set, `Bytes` as hex. A query is
-one round trip, and the server keeps nothing between runs. MySQL reads a
-query's rows whole before `each()` hands them out, so another query can run
-inside it.
+one round trip, and the server keeps nothing between runs. MySQL and
+PostgreSQL read a query's rows whole before `each()` hands them out, so
+another query can run inside it.
 
 **Transactions.** `transaction(fn)` commits when the function returns and rolls
 back when it throws (the exception goes on). A transaction inside another is a
@@ -113,7 +143,9 @@ savepoint: only its own changes are undone. `begin()`, `commit()`,
 **Errors** are `DbError`s with the database's message, its `code` (SQLite's
 extended code: 2067 for UNIQUE, 787 for a foreign key, 5 for "database is
 locked"; MySQL's error number: 1062 for a duplicate key, 1452 for a foreign
-key, 1213 for a deadlock, 2002 and 2003 for a server it cannot reach) and the
+key, 1213 for a deadlock, 2002 and 2003 for a server it cannot reach; 0 from
+PostgreSQL), its SQLSTATE in `state` when the database gives one ("23505" for
+a unique violation in PostgreSQL, "23000" in MySQL; "" from SQLite) and the
 `sql`. Using a closed connection is a `StateError`.
 
 **Threads.** A connection is for one thread at a time. `new Pool(max, factory)`
@@ -123,45 +155,54 @@ transaction left open. `acquire()` / `release(c)` do the same by hand.
 
 ## Speed and memory
 
-On a 4-core laptop (i5-8350U), against Python's `sqlite3` module (written in C)
-on the same in-memory database:
+On a 4-core laptop (i5-8350U), against Python's fastest C-based clients doing
+the same work, best of three. The machine was busy with other builds while
+these ran, so the times are high for both; client CPU time (what each client
+spends itself, server time aside) is the steadier comparison.
+
+SQLite (Python's `sqlite3`), an in-memory database:
 
 | | grav-db | Python |
 |---|---|---|
-| insert 100,000 rows in a transaction | 0.10 s | 0.13 s |
-| read 100,000 rows of 4 columns | 0.05 s | 0.12 s |
-| 20,000 lookups by primary key | 0.03 s | 0.06 s |
-| peak memory, holding all 100,000 rows | 26 MiB | 35 MiB |
+| insert 100,000 rows one at a time, in a transaction | 0.27 s | 0.98 s |
+| `executeMany` of 100,000 rows | 0.25 s | 0.34 s |
+| read 100,000 rows of 4 columns | 0.08 s | 0.41 s |
+| 20,000 lookups by primary key | 0.07 s | 0.13 s |
+| client CPU, all of it | 0.80 s | 1.64 s |
+| peak memory | 51 MiB | 58 MiB |
+
+MariaDB 11.8 (Python's `MySQLdb`, mysqlclient), over its Unix socket, InnoDB:
+
+| | grav-db | Python |
+|---|---|---|
+| `executeMany` of 100,000 rows | 1.15 s | 2.14 s |
+| read 100,000 rows of 4 columns | 0.17 s | 0.16 s |
+| 20,000 lookups by primary key | 1.9 s | 2.3 s |
+| 20,000 single inserts in a transaction | 2.2 s | 2.5 s |
+| client CPU, all of it | 1.36 s | 3.46 s |
 
 A result keeps its values in one array, row after row (a `Row` is a view of its
-part), and each row is filled in C. SQLite's `each()` streams rows in constant
-memory.
-
-Against MariaDB 11.8 on the same machine (over its Unix socket, InnoDB),
-compared with Python's `MySQLdb` (mysqlclient, written in C), best of three:
-
-| | grav-db | Python |
-|---|---|---|
-| insert 100,000 rows in a transaction, one at a time | 11.6 s | 13.8 s |
-| read 100,000 rows of 4 columns | 0.11 s | 0.15 s |
-| 20,000 lookups by primary key | 1.6 s | 2.0 s |
-| peak memory, holding all 100,000 rows | 35 MiB | 47 MiB |
-
-Single-row inserts and lookups wait on the server, one round trip each, for
-both clients.
+part), each row is filled in C, and arguments are bound in C. SQLite's
+`each()` streams rows in constant memory; MySQL reads rows straight off the
+connection into the result. Single-row statements against a server wait on
+it, one round trip each, for any client: `executeMany` is the way to go
+faster.
 
 ## Tests
 
 ```bash
 grav test tests/sqlite.grav
 GRAV_DB_MYSQL='mysql://user:password@localhost/grav_test' grav test tests/mysql.grav
+GRAV_DB_POSTGRES='postgresql://user:password@localhost/grav_test' grav test tests/postgres.grav
 ```
 
 They cover values in and out, NULLs and blobs, errors, transactions and
 savepoints, the statement cache, streaming, a pool shared by threads, and rows
-into objects through reflection. The MySQL tests make and drop their own
-`gdb_*` tables in the database the URL names. Without `GRAV_DB_MYSQL`, only
-the tests that need no server run: URLs and connection errors.
+into objects through reflection, and `executeMany`. The server tests make and
+drop their own `gdb_*` tables in the database the URL names. Without
+`GRAV_DB_MYSQL` or `GRAV_DB_POSTGRES`, only the tests that need no server run
+(URLs and connection errors). The PostgreSQL driver is new: so far only its
+tests that need no server have run.
 
 ## License
 
