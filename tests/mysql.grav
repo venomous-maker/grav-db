@@ -63,7 +63,7 @@ test "values in and out, NULL and blobs" {
     assertEq(rows.size(), 2)
     assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,role,note,price,born,big,flags")
     assertEq(rows.get(0).toString(), "{id: 1, email: \"ada@example.com\", age: 36, score: 9.5, active: 1, role: 2, note: \"it's \"quoted\" \\ ünï\", " +
-                                     "price: \"19.99\", born: 1815-12-10 00:00:00, big: 18446744073709551615, flags: 5}")
+                                     "price: 19.99, born: 1815-12-10 00:00:00, big: 18446744073709551615, flags: 5}")
     assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, role: NULL, note: NULL, " +
                                      "price: NULL, born: NULL, big: NULL, flags: NULL}")
     let ada = db.queryOne("SELECT * FROM gdb_users WHERE email = ?", ["ada@example.com"])
@@ -141,7 +141,7 @@ test "statements, streaming and the cache" {
     let st = db.prepare("INSERT INTO gdb_n (v) VALUES (?)")
     db.transaction(fn() { for (i in 0..1000) { st.run([i]) } })
     st.close()
-    assertEq(db.queryValue("SELECT SUM(v) FROM gdb_n") as string, "499500")      // (SUM is a DECIMAL)
+    assertEq((db.queryValue("SELECT SUM(v) FROM gdb_n") as Decimal).toString(), "499500")      // (SUM is a DECIMAL)
     let seen = new Array<string>()
     db.each("SELECT v FROM gdb_n WHERE v < ? ORDER BY v", [3], fn(r: Row) {
         let twice = db.queryValue("SELECT v * 2 FROM gdb_n WHERE v = ?", [r.get("v")]) as long
@@ -241,5 +241,26 @@ test "dates and times come out as DateTime" {
     try { r.getDateTime("t") } catch (e: ValueError) { bad = e.message() }
     assertEq(bad, "column 't' is not a date: 12:34:56")
     db.exec("DROP TABLE gdb_t")
+    db.close()
+}
+
+test "DECIMAL as Decimal, JSON as JsonValue" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_d; CREATE TABLE gdb_d (id INT PRIMARY KEY, price DECIMAL(12,2), rate DECIMAL(38,30), meta JSON, plain TEXT)")
+    let price = Decimal.parse("19.99")
+    db.execute("INSERT INTO gdb_d VALUES (1, ?, ?, ?, ?)", [price, Decimal.parse("0.333333333333333333333333333333"),
+                                                            Json.parse("{\"tags\": [\"a\", \"b\"], \"n\": 2}"), "{\"not\": \"parsed\"}"])
+    let r = db.queryOne("SELECT price, rate, meta, plain, price * 3 AS triple FROM gdb_d")
+    assertEq("${r.get("price")} ${r.get("rate")} ${r.get("triple")}", "19.99 0.333333333333333333333333333333 59.97")
+    assertEq(r.get("price") is Decimal && r.getDecimal("price") == price && r.getFloat("price") == 19.99, true)
+    assertEq(r.getJson("meta")["tags"][1].asString() + " ${r.getJson("meta").getInt("n", 0)}", "b 2")
+    assertEq(r.get("plain") is string && r.getJson("plain")["not"].asString() == "parsed", true)
+    assertEq(db.queryValue("SELECT id FROM gdb_d WHERE price = ?", [Decimal.parse("19.990")]) as long, 1 as long)   // (exact)
+    let bad = ""
+    try { r.getInt("price") } catch (e: ValueError) { bad = e.message() }
+    assertEq(bad, "column 'price' is not a whole number: 19.99")
+    assertEq(db.queryOne("SELECT CAST(7 AS DECIMAL(5,0)) AS w").getInt("w"), 7 as long)
+    db.exec("DROP TABLE gdb_d")
     db.close()
 }

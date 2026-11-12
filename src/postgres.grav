@@ -386,6 +386,7 @@ namespace db {
                     case 700: case 701: a.tag = GRAV_ANY_FLOAT; a.v.f = strtod(p, 0); break;
                     case 16: a.tag = GRAV_ANY_BOOL; a.v.b = *p == 't'; break;
                     case 17: case 1082: case 1114: case 1184: bins++; break;   /* bytea; date, timestamp, timestamptz */
+                    case 1700: case 114: case 3802: bins++; break;             /* numeric; json, jsonb */
                     default: a.tag = GRAV_ANY_STR; a.v.s = grav_pg_copy(p, grav_pg.getlength(r, row, i));
                 }
             }
@@ -652,6 +653,12 @@ namespace db {
             let h = self.h;
             let pg = self.connection();
             self.bind(rows[0]);
+            // A column null in the first row is bytea when a later row has Bytes there.
+            let first = rows[0];
+            for (j in 0..first.size()) {
+                if (first[j] != null) { continue; }
+                for (row in rows) { if (row[j] is Bytes) { %{ ((grav_pg_stmt*)h)->want[j] = 17; %}; break; } }
+            }
             if (%{ grav_pg_ready_stmt((grav_pg_stmt*)h) %} as int != 0) { throw self.failure(pg); }
             if (%{ grav_pg_pipe.enter(pg) %} as int == 0) { throw self.failure(pg); }
             let total = 0 as long;
@@ -704,9 +711,9 @@ namespace db {
                     i += 1;
                     continue;
                 }
-                if (a is DateTime) {                          // its local time and zone: exact for timestamptz
-                    let d = a as DateTime;
-                    let text: any = d.toString() + d.format("%z");
+                if (a is DateTime || a is Decimal || a is JsonValue) {   // a DateTime with its zone: exact for timestamptz
+                    let text: any = a is DateTime ? (a as DateTime).toString() + (a as DateTime).format("%z")
+                                  : a is JsonValue ? (a as JsonValue).toJson() : (a as Decimal).toString();
                     self.keep.push(text);                      // (libpq reads it when the statement runs)
                     %{ grav_pg_arg((grav_pg_stmt*)h, i, text); %};
                     i += 1;
@@ -769,6 +776,12 @@ namespace db {
                     let us = 0;
                     if (%{ grav_dt_iso(grav_pg.getvalue(r, row, i), &secs, &us) %} as bool) { vals.set(at + i, DateTime.fromUnix(secs, us)); }
                     else { vals.set(at + i, %{ grav_pg_copy(grav_pg.getvalue(r, row, i), grav_pg.getlength(r, row, i)) %} as string); }   // (infinity, BC)
+                    continue;
+                }
+                if (kind == 1700 || kind == 114 || kind == 3802) {
+                    let text = %{ grav_pg_copy(grav_pg.getvalue(r, row, i), grav_pg.getlength(r, row, i)) %} as string;
+                    let made: any = kind == 1700 ? Decimal.tryParse(text) as any : Json.tryParse(text) as any;
+                    vals.set(at + i, made == null ? text as any : made);   // (NaN, or past 38 digits: the text)
                     continue;
                 }
                 if (kind != 17) { continue; }

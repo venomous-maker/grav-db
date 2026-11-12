@@ -46,8 +46,8 @@ test "values in and out, NULL and bytea" {
     let rows = db.query("SELECT id, email, age, score, active, role, note, price, born, tags, meta FROM gdb_users ORDER BY id")
     assertEq(Str.join(rows.columns, ","), "id,email,age,score,active,role,note,price,born,tags,meta")
     assertEq(rows.get(0).toString(), "{id: 1, email: \"ada@example.com\", age: 36, score: 9.5, active: true, role: 2, " +
-                                     "note: \"it's \"quoted\" \\ ünï\", price: \"19.99\", born: 1815-12-10 00:00:00, " +
-                                     "tags: \"{math,engines}\", meta: \"{\"lang\": \"grav\"}\"}")
+                                     "note: \"it's \"quoted\" \\ ünï\", price: 19.99, born: 1815-12-10 00:00:00, " +
+                                     "tags: \"{math,engines}\", meta: {\"lang\":\"grav\"}}")
     assertEq(rows.get(1).toString(), "{id: 2, email: \"bob@example.com\", age: NULL, score: NULL, active: NULL, role: NULL, " +
                                      "note: NULL, price: NULL, born: NULL, tags: NULL, meta: NULL}")
     let ada = db.queryOne("SELECT * FROM gdb_users WHERE email = ?", ["ada@example.com"])
@@ -59,7 +59,7 @@ test "values in and out, NULL and bytea" {
     // RETURNING gives insert() the id in one round trip; $n placeholders work too.
     assertEq(db.insert("INSERT INTO gdb_users (email) VALUES ($1) RETURNING id", ["cy@example.com"]), 3 as long)
     // `?`s in strings, quoted names, dollar quotes and comments are left alone; `??` is a `?`.
-    let s = db.queryOne("SELECT ? || '?' AS \"a?\", ?::float8 AS b, ?::bool AS c, ? IS NULL AS d, ?::int8 AS e, " +
+    let s = db.queryOne("SELECT ? || '?' AS \"a?\", ?::float8 AS b, ?::bool AS c, ?::text IS NULL AS d, ?::int8 AS e, " +
                         "$$it's ?$$ AS f, '{\"k\":1}'::jsonb ?? 'k' AS g /* ? */ -- ?\n, E'\\'?' AS h",
                         ["x", 2.5, false, null, -9223372036854775807 as long - 1])
     assertEq("${s.getString("a?")} ${s.getFloat("b")} ${s.get("c")} ${s.get("d")} ${s.getInt("e")} ${s.getString("f")} ${s.get("g")} ${s.getString("h")}",
@@ -218,5 +218,23 @@ test "dates and times come out as DateTime" {
     assertEq(db.queryOne("SELECT tz FROM gdb_t").getDateTime("tz") == when, true)
     assertEq(db.queryValue("SELECT id FROM gdb_t WHERE tz = ?", [when]) as long, 1 as long)
     db.exec("DROP TABLE gdb_t")
+    db.close()
+}
+
+test "numeric as Decimal, json and jsonb as JsonValue" {
+    let db = server()
+    if (db == null) { return }
+    db.exec("DROP TABLE IF EXISTS gdb_d; CREATE TABLE gdb_d (id INT PRIMARY KEY, price NUMERIC(12,2), huge NUMERIC, meta JSONB, raw JSON)")
+    let price = Decimal.parse("19.99")
+    db.execute("INSERT INTO gdb_d VALUES (1, ?, ?, ?, ?)", [price, "123456789012345678901234567890123456789012.5",
+                                                            Json.parse("{\"tags\": [\"a\", \"b\"], \"n\": 2}"), Json.parse("[1, 2]")])
+    let r = db.queryOne("SELECT price, huge, meta, raw, price * 3 AS triple, 'NaN'::numeric AS nan FROM gdb_d")
+    assertEq("${r.get("price")} ${r.get("triple")} ${r.get("meta")} ${r.get("raw")}", "19.99 59.97 {\"n\":2,\"tags\":[\"a\",\"b\"]} [1,2]")
+    assertEq(r.get("price") is Decimal && r.getDecimal("price") == price, true)
+    assertEq(r.get("huge") is string && r.get("nan") is string, true)               // (past 38 digits, NaN: text)
+    assertEq(r.getJson("meta")["tags"][1].asString(), "b")
+    assertEq(db.queryValue("SELECT id FROM gdb_d WHERE price = ?", [Decimal.parse("19.990")]) as long, 1 as long)
+    assertEq(db.queryValue("SELECT id FROM gdb_d WHERE meta @> ?::jsonb", [Json.parse("{\"n\": 2}")]) as long, 1 as long)
+    db.exec("DROP TABLE gdb_d")
     db.close()
 }

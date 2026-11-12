@@ -108,12 +108,16 @@ namespace db {
             default: return -1;
         }
     }
-    /* Whether a column was declared DATE, DATETIME or TIMESTAMP (its text values
-       become DateTimes). */
-    static int grav_sq_is_date(sqlite3_stmt* st, int i) {
+    /* What a column was declared as: 2 DATE, DATETIME or TIMESTAMP (its text
+       becomes DateTimes), 3 DECIMAL or NUMERIC (Decimals), 4 JSON (JsonValues),
+       else 0. */
+    static int grav_sq_kind(sqlite3_stmt* st, int i) {
         const char* d = grav_sq.column_decltype(st, i);
         if (!d) return 0;
-        return !strncasecmp(d, "DATE", 4) || !strncasecmp(d, "TIMESTAMP", 9);
+        if (!strncasecmp(d, "DATE", 4) || !strncasecmp(d, "TIMESTAMP", 9)) return 2;
+        if (!strncasecmp(d, "DECIMAL", 7) || !strncasecmp(d, "NUMERIC", 7)) return 3;
+        if (!strcasecmp(d, "JSON") || !strcasecmp(d, "JSONB")) return 4;
+        return 0;
     }
     /* Binds a[from..n) to parameters from+1..n: n when all are bound, else the
        index of the first that is not a scalar or fails (*rc: -1 or SQLite's code). */
@@ -288,7 +292,8 @@ namespace db {
         private st: byte*                         // sqlite3_stmt*
         private db: byte*                         // its sqlite3*, for error messages
         private cols: Columns                     // the result's columns, made on the first row
-        private dates: Array<int>                 // which of them were declared DATE, DATETIME or TIMESTAMP
+        private special: Array<int>               // the columns declared as dates, decimals or JSON
+        private kinds: Array<int>                 // and which (see grav_sq_kind)
         private closed: bool
         // Kept by its connection's cache, and lent out now (see SqliteConnection).
         public __cached: bool
@@ -299,7 +304,8 @@ namespace db {
             self.st = st;
             self.db = db;
             self.cols = null;
-            self.dates = new Array<int>();
+            self.special = new Array<int>();
+            self.kinds = new Array<int>();
             self.closed = false;
             self.__cached = false;
             self.__inUse = false;
@@ -389,8 +395,8 @@ namespace db {
                     let p = b.rawData();
                     let n = b.size();
                     rc = %{ grav_sq.bind_blob((sqlite3_stmt*)st, k, p, n, GRAV_SQ_STATIC) %} as int;
-                } else if (rc == -1 && a is DateTime) {
-                    let text = (a as DateTime).toString();               // (copied: SQLITE_TRANSIENT)
+                } else if (rc == -1 && (a is DateTime || a is Decimal || a is JsonValue)) {
+                    let text = a is JsonValue ? (a as JsonValue).toJson() : "${a}";   // (copied: SQLITE_TRANSIENT)
                     let n = text.length;
                     rc = %{ grav_sq.bind_text((sqlite3_stmt*)st, k, text, n, (void (*)(void*))-1) %} as int;
                 }
@@ -427,22 +433,33 @@ namespace db {
                 let names = new Array<string>(n);
                 for (i in 0..n) { names.push(%{ grav_sq_copy(grav_sq.column_name((sqlite3_stmt*)st, i), -1) %} as string); }
                 self.cols = new Columns(names);
-                self.dates = new Array<int>();
-                for (i in 0..n) { if (%{ grav_sq_is_date((sqlite3_stmt*)st, i) %} as bool) { self.dates.push(i); } }
+                self.special = new Array<int>();
+                self.kinds = new Array<int>();
+                for (i in 0..n) {
+                    let k = %{ grav_sq_kind((sqlite3_stmt*)st, i) %} as int;
+                    if (k != 0) { self.special.push(i); self.kinds.push(k); }
+                }
             }
             return self.cols;
         }
         // Appends the current row's n values to `vals` (filled in C; BLOBs become
-        // Bytes here, and dates in a date column DateTimes).
+        // Bytes here, and what columns declared as dates, decimals or JSON hold
+        // DateTimes, Decimals and JsonValues).
         private fn fill(vals: Array<any>, n: int) {
             let at = vals.size();
             vals.reserve(at + n);
             let st = self.st;
             let blobs = %{ grav_sq_fill((sqlite3_stmt*)st, n, (GravAny*)vals->data + vals->len) %} as int;
             %{ vals->len += n; %};
-            for (i in self.dates) {
+            for (j, i in self.special) {
                 let v = vals[at + i];
-                if (v is string) { let d = DateTime.tryParse(v as string); if (d != null) { vals.set(at + i, d); } }
+                if (v == null) { continue; }
+                let kind = self.kinds[j];
+                if (kind == 2 && v is string) { let d = DateTime.tryParse(v as string); if (d != null) { vals.set(at + i, d); } }
+                else if (kind == 3) {
+                    let d: Decimal = v is long ? Decimal.of(v as long) : v is float ? Decimal.fromFloat(v as float) : v is string ? Decimal.tryParse(v as string) : null;
+                    if (d != null) { vals.set(at + i, d); }
+                } else if (kind == 4 && v is string) { let js = Json.tryParse(v as string); if (js != null) { vals.set(at + i, js); } }
             }
             if (blobs == 0) { return; }
             for (i in 0..n) {

@@ -67,6 +67,9 @@ namespace db {
         int (*library_init)(int, char**, char**);
     } grav_my;
     static int (*grav_my_thread_init)(void);          /* (not in every library) */
+    /* MariaDB's extended metadata (JSON columns are LONGTEXT marked "json"); libmysqlclient has none. */
+    typedef struct { const char* str; size_t length; } grav_my_cstr;
+    static int (*grav_my_field_attr)(grav_my_cstr*, const void*, int);
     static int grav_my_ok = 0;
     static pthread_once_t grav_my_once = PTHREAD_ONCE_INIT;
 
@@ -93,6 +96,7 @@ namespace db {
         if (!grav_my.library_init) GRAV_MY_FN(library_init, "mysql_server_init");   /* (libmariadb's name) */
     #undef GRAV_MY_FN
         *(void**)(&grav_my_thread_init) = dlsym(h, "mysql_thread_init");
+        *(void**)(&grav_my_field_attr) = dlsym(h, "mariadb_field_attr");
         void** all = (void**)&grav_my;
         for (size_t i = 0; i < sizeof grav_my / sizeof(void*); i++) if (!all[i]) return;
         grav_my_ok = grav_my.library_init(0, 0, 0) == 0;
@@ -346,9 +350,15 @@ namespace db {
         return f->charsetnr == 63 && ((f->type >= 249 && f->type <= 255) || f->type == 15);
     }
     /* 1 for a binary string, 2 for a DATE, DATETIME or TIMESTAMP (made a
-       DateTime), else 0. */
+       DateTime), 3 for a DECIMAL (a Decimal), 4 for JSON (a JsonValue), else 0. */
     static int grav_my_kind(const grav_my_field* f) {
+        if (f->type == 245) return 4;                                  /* (MySQL's JSON) */
+        if (f->type == 252 && grav_my_field_attr) {                    /* (MariaDB's: LONGTEXT, format "json") */
+            grav_my_cstr a = { 0, 0 };
+            if (!grav_my_field_attr(&a, f, 1 /* FORMAT_NAME */) && a.length == 4 && !strncmp(a.str, "json", 4)) return 4;
+        }
         if (grav_my_is_binary(f)) return 1;
+        if (f->type == 0 || f->type == 246) return 3;
         return f->type == 7 || f->type == 10 || f->type == 12 || f->type == 14 ? 2 : 0;
     }
     /* Writes a row's n values to out[0..n). A binary string or a date is left null and
@@ -372,6 +382,7 @@ namespace db {
                     break;
                 }
                 case 4: case 5: a.tag = GRAV_ANY_FLOAT; a.v.f = strtod(p, 0); break;
+                case 0: case 245: case 246: bins++; break;                   /* (DECIMAL, JSON: made in Grav) */
                 case 16: {                                                           /* BIT(n): big-endian bytes */
                     unsigned long long x = 0;
                     for (unsigned long j = 0; j < lens[i] && j < 8; j++) x = (x << 8) | (unsigned char)p[j];
@@ -757,9 +768,13 @@ namespace db {
                     let n = b.size();
                     %{ grav_my_blob((grav_my_stmt*)h, at, (const unsigned char*)p, (size_t)n); %};
                     rc = 0;
-                } else if (rc == -1 && a is DateTime) {
-                    let text: any = (a as DateTime).toString();
+                } else if (rc == -1 && (a is DateTime || a is JsonValue)) {
+                    let text: any = a is JsonValue ? (a as JsonValue).toJson() : (a as DateTime).toString();
                     rc = %{ grav_my_arg((grav_my_stmt*)h, at, text) %} as int;
+                } else if (rc == -1 && a is Decimal) {
+                    let digits = (a as Decimal).toString();      // (a number: written as it is, so DECIMAL compares exactly)
+                    %{ grav_my_seg((grav_my_stmt*)h, at); grav_my_put((grav_my_stmt*)h, digits, grav_str_len(digits)); %};
+                    rc = 0;
                 }
                 if (rc != 0) {
                     %{ ((grav_my_stmt*)h)->len = 0; ((grav_my_stmt*)h)->from = 0; %};
@@ -829,6 +844,12 @@ namespace db {
                 let kind = %{ ((char**)row)[i] == 0 ? 0 : grav_my_kind(&((grav_my_field*)f)[i]) %} as int;
                 if (kind == 0) { continue; }
                 let len = %{ (int)((unsigned long*)lens)[i] %} as int;
+                if (kind == 3 || kind == 4) {
+                    let text = %{ grav_my_copy(((char**)row)[i], len) %} as string;
+                    let made: any = kind == 3 ? Decimal.tryParse(text) as any : Json.tryParse(text) as any;
+                    vals.set(at + i, made == null ? text as any : made);
+                    continue;
+                }
                 if (kind == 2) {
                     let secs = 0 as long;
                     let us = 0;

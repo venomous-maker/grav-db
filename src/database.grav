@@ -11,11 +11,13 @@
 //   db.transaction(fn() { db.execute("UPDATE users SET age = age + 1") })
 //
 // Values go in and come out as `any`: whole numbers, floats, bools, strings,
-// Bytes, DateTimes and null (an enum goes in as its number). Date and time
-// columns come out as DateTime (to the microsecond; a value it cannot hold, such
-// as MySQL's 0000-00-00 or PostgreSQL's infinity, stays a string), and a
-// DateTime argument goes in as its local time ("2024-02-28 09:30:15.250000";
-// PostgreSQL also gets its zone). A connection is used by one thread at a time;
+// Bytes, DateTimes, Decimals, JsonValues and null (an enum goes in as its
+// number). Date and time columns come out as DateTime (to the microsecond),
+// DECIMAL and NUMERIC as Decimal (exact), and JSON as a parsed JsonValue; a
+// value those cannot hold (MySQL's 0000-00-00, PostgreSQL's infinity or NaN, a
+// number past 38 digits) stays a string. A DateTime argument goes in as its
+// local time ("2024-02-28 09:30:15.250000"; PostgreSQL also gets its zone), a
+// Decimal as its digits, a JsonValue as its JSON text. A connection is used by one thread at a time;
 // Pool lends connections to many.
 import "std"
 
@@ -110,6 +112,11 @@ namespace db {
             if (v is int) { return (v as int) as long; }
             if (v is float) { return (v as float) as long; }
             if (v is bool) { return (v as bool) ? 1 : 0; }
+            if (v is Decimal) {
+                let d = v as Decimal;
+                if (!(d == d.round(0))) { throw new ValueError("column '" + name + "' is not a whole number: " + d.toString()); }
+                return d.toLong();
+            }
             if (v is string) {
                 let s = Str.trim(v as string);
                 let bad: long = -9223372036854775807;
@@ -126,6 +133,7 @@ namespace db {
             if (v == null) { return 0.0; }
             if (v is long) { return (v as long) as float; }
             if (v is int) { return (v as int) as float; }
+            if (v is Decimal) { return (v as Decimal).toFloat(); }
             if (v is string) { return Format.toFloatOr(v as string, 0.0); }
             throw new ValueError("column '" + name + "' is not a number");
         }
@@ -146,6 +154,32 @@ namespace db {
             if (v is Bytes) { return v as Bytes; }
             if (v == null) { return new Bytes(); }
             return Bytes.fromString(self.getString(name));
+        }
+        // Column `name` as an exact Decimal (null for NULL): a DECIMAL or NUMERIC
+        // column comes out as one already; whole numbers, floats (their shortest
+        // decimal) and numeric text are converted. ValueError for anything else.
+        fn getDecimal(name: string) -> Decimal {
+            let v = self.get(name);
+            if (v == null) { return null; }
+            if (v is Decimal) { return v as Decimal; }
+            if (v is long) { return Decimal.of(v as long); }
+            if (v is int) { return Decimal.of((v as int) as long); }
+            if (v is float) { return Decimal.fromFloat(v as float); }
+            let d = v is string ? Decimal.tryParse(v as string) : null;
+            if (d == null) { throw new ValueError("column '" + name + "' is not a decimal number: " + self.getString(name)); }
+            return d;
+        }
+        // Column `name` as JSON (null for NULL): a JSON column comes out parsed
+        // already; text is parsed (ValueError when it is not JSON).
+        fn getJson(name: string) -> JsonValue {
+            let v = self.get(name);
+            if (v == null) { return null; }
+            if (v is JsonValue) { return v as JsonValue; }
+            if (v is string) {
+                let j = Json.tryParse(v as string);
+                if (j != null) { return j; }
+            }
+            throw new ValueError("column '" + name + "' is not JSON: " + self.getString(name));
         }
         // Column `name` as a DateTime (null for NULL): a date or time column comes
         // out as one already; text such as "2024-02-28 09:30:15" is parsed (see

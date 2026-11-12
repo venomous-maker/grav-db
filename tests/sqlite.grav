@@ -194,3 +194,14 @@ test "columns declared DATE, DATETIME or TIMESTAMP give DateTimes" {
     assertEq(r.get("dt") is DateTime && r.get("s") is string && r.getDateTime("s") == when, true)
     assertEq(db.queryValue("SELECT id FROM t WHERE dt = ?", [when]) as long, 1 as long)
 }
+
+test "columns declared DECIMAL, NUMERIC or JSON give Decimals and JsonValues" {
+    if (!Sqlite.available()) { return }
+    let db = Sqlite.open(":memory:")
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, price DECIMAL(12,2), qty NUMERIC, label TEXT, meta JSON)")
+    db.execute("INSERT INTO t VALUES (1, ?, ?, ?, ?)", [Decimal.parse("19.99"), 3, Decimal.parse("0.10"), Json.parse("{\"n\": 2}")])
+    let r = db.queryOne("SELECT price, qty, label, meta FROM t")
+    assertEq("${r.get("price")} ${r.get("qty")} ${r.get("label")} ${r.get("meta")}", "19.99 3 0.10 {\"n\":2}")
+    assertEq(r.get("price") is Decimal && r.get("qty") is Decimal && r.get("label") is string && r.get("meta") is JsonValue, true)
+    assertEq(r.getDecimal("label") == Decimal.parse("0.1"), true)
+}
