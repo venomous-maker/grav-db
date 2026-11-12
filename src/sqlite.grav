@@ -106,6 +106,13 @@ namespace db {
             default: return -1;
         }
     }
+    /* Binds a[from..n) to parameters from+1..n: n when all are bound, else the
+       index of the first that is not a scalar or fails (*rc: -1 or SQLite's code). */
+    static int grav_sq_bind_from(sqlite3_stmt* st, const GravAny* a, int from, int n, int* rc) {
+        for (int i = from; i < n; i++) { int r = grav_sq_bind(st, i + 1, a[i]); if (r) { *rc = r; return i; } }
+        *rc = 0;
+        return n;
+    }
     /* Writes the current row's n columns to out[0..n): integers, floats, text (a
        fresh counted string each) and NULL. A BLOB is left null and counted: the
        caller makes its Bytes. Returns how many BLOBs there were. */
@@ -168,6 +175,7 @@ namespace db {
     class SqliteConnection extends Connection {
         private db: byte*                        // sqlite3*
         private cache: HashMap<string, SqliteStatement>
+        private recent: Array<SqliteStatement>    // 16 of the cached, by their SQL string's address (no hashing)
         private openFlag: bool
         // The path it was opened with.
         public path: string
@@ -177,6 +185,8 @@ namespace db {
             self.db = db;
             self.path = path;
             self.cache = new HashMap<string, SqliteStatement>();
+            self.recent = new Array<SqliteStatement>(16);
+            for (i in 0..16) { self.recent.push(null); }
             self.openFlag = true;
         }
         destructor() { self.close(); }
@@ -207,6 +217,7 @@ namespace db {
             self.openFlag = false;
             for (st in self.cache.values()) { st.close(); }
             self.cache.clear();
+            for (i in 0..16) { self.recent[i] = null; }
             let db = self.db;
             %{ grav_sq.close_v2((sqlite3*)db); %};        // (statements still held elsewhere keep it until they close)
         }
@@ -215,15 +226,21 @@ namespace db {
         // inside another's each()): then a fresh one.
         protected fn borrow(sql: string) -> Statement {
             self.need();
-            let st = self.cache.getOr(sql, null);
-            if (st == null) {
-                if (self.cache.size() >= 128) { self.trim(); }
-                st = self.make(sql);
-                st.__cached = true;
-                self.cache.put(sql, st);
-            } else if (st.__inUse) {
-                return self.make(sql);
+            let slot = %{ (int)(((unsigned long)sql >> 4) & 15) %} as int;
+            let st = self.recent[slot];
+            let same = false;
+            if (st != null) { let had = st.sql; same = %{ had == sql %} as bool; }   // (the very string: same SQL)
+            if (!same) {
+                st = self.cache.getOr(sql, null);
+                if (st == null) {
+                    if (self.cache.size() >= 128) { self.trim(); }
+                    st = self.make(sql);
+                    st.__cached = true;
+                    self.cache.put(sql, st);
+                }
+                self.recent[slot] = st;
             }
+            if (st.__inUse) { return self.make(sql); }
             st.__inUse = true;
             return st;
         }
@@ -238,6 +255,7 @@ namespace db {
                 if (!st.__inUse && gone.size() < 64) { gone.push(k); }
             }
             for (k in gone) { self.cache[k].close(); self.cache.remove(k); }
+            for (i in 0..16) { self.recent[i] = null; }
         }
         private fn make(sql: string) -> SqliteStatement {
             self.need();
@@ -346,9 +364,15 @@ namespace db {
             if (args.size() != want) {
                 throw new DbError("the SQL has ${want} placeholder(s) but ${args.size()} argument(s) were given", 0, self.sql);
             }
-            for (i, a in args) {
+            let n = args.size();
+            let i = 0;
+            while (i < n) {
+                let rc = 0;
+                i = %{ grav_sq_bind_from((sqlite3_stmt*)st, (const GravAny*)args->data, i, n, &rc) %} as int;   // the scalars, in C
+                if (i >= n) { break; }
+                let a = args[i];
                 let k = i + 1;
-                let rc = %{ grav_sq_bind((sqlite3_stmt*)st, k, a) %} as int;   // scalars in one call
+                i += 1;
                 if (rc == -1 && a is Bytes) {
                     let b = a as Bytes;
                     let p = b.rawData();
@@ -368,8 +392,8 @@ namespace db {
                 if (rc != 0) { throw self.finish(true); }
             }
         }
-        // Resets it for the next run (and forgets the arguments); with `failed`,
-        // the error the database reports.
+        // Resets it for the next run; with `failed`, the error the database
+        // reports. (Its arguments stay bound until the next run binds them all again.)
         private fn finish(failed: bool) -> DbError {
             let st = self.st;
             let db = self.db;
@@ -378,7 +402,7 @@ namespace db {
                 err = new DbError(%{ grav_sq_copy(grav_sq.errmsg((sqlite3*)db), -1) %} as string,
                                   %{ grav_sq.extended_errcode((sqlite3*)db) %} as int, self.sql);
             }
-            %{ grav_sq.reset((sqlite3_stmt*)st); grav_sq.clear_bindings((sqlite3_stmt*)st); %};
+            %{ grav_sq.reset((sqlite3_stmt*)st); %};
             return err;
         }
         private fn columns() -> Columns {
