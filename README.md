@@ -169,7 +169,6 @@ SQLite (Python's `sqlite3`), an in-memory database:
 | read 100,000 rows of 4 columns | 0.08 s | 0.41 s |
 | 20,000 lookups by primary key | 0.07 s | 0.13 s |
 | client CPU, all of it | 0.80 s | 1.64 s |
-| peak memory | 51 MiB | 58 MiB |
 
 MariaDB 11.8 (Python's `MySQLdb`, mysqlclient), over its Unix socket, InnoDB:
 
@@ -180,6 +179,16 @@ MariaDB 11.8 (Python's `MySQLdb`, mysqlclient), over its Unix socket, InnoDB:
 | 20,000 lookups by primary key | 1.9 s | 2.3 s |
 | 20,000 single inserts in a transaction | 2.2 s | 2.5 s |
 | client CPU, all of it | 1.36 s | 3.46 s |
+
+Memory, reading 100,000 rows of 4 columns and holding them (peak resident
+size; in brackets, the same program that only opens the connection):
+
+| | grav-db | Python |
+|---|---|---|
+| SQLite | 25 MiB (12) | 39 MiB (17) |
+| MariaDB | 26 MiB (12) | 47 MiB (18) |
+
+so the rows take 13–14 MiB in grav-db and 22–29 MiB in Python.
 
 A result keeps its values in one array, row after row (a `Row` is a view of its
 part), each row is filled in C, and arguments are bound in C. SQLite's
