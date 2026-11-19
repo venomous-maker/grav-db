@@ -6,6 +6,10 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Performance
+
+- `quote()` skips escaping a name that holds no quote character (nearly all).
+
 ## 0.1.0 (2026-11-19)
 
 The first tagged release. Needs grav 1.7.0 or newer.
