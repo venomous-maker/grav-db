@@ -577,7 +577,7 @@ namespace db {
         fn isOpen() -> bool { return self.openFlag; }
         fn driver() -> string { return "mysql"; }
         // `name` as a quoted identifier: `name`.
-        fn quote(name: string) -> string { return "`" + Str.replace(name, "`", "``") + "`"; }
+        fn quote(name: string) -> string { return "`" + (Str.indexOf(name, "`") < 0 ? name : Str.replace(name, "`", "``")) + "`"; }
         fn close() {
             if (!self.openFlag) { return; }
             self.openFlag = false;
