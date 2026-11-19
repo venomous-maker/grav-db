@@ -381,7 +381,9 @@ namespace db {
         // The statement that starts a transaction ("BEGIN").
         protected fn beginSql() -> string { return "BEGIN"; }
         // `name` quoted as an identifier for this database ("users" -> "\"users\"").
-        fn quote(name: string) -> string { return "\"" + Str.replace(name, "\"", "\"\"") + "\""; }
+        fn quote(name: string) -> string {
+            return "\"" + (Str.indexOf(name, "\"") < 0 ? name : Str.replace(name, "\"", "\"\"")) + "\"";   // (names rarely hold a quote)
+        }
     }
 
     // Connections shared by threads. `with` lends one to a function and takes it
