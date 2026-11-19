@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.1 (2026-11-19)
+
 ### Performance
 
 - `quote()` skips escaping a name that holds no quote character (nearly all).
