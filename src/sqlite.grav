@@ -263,8 +263,7 @@ namespace db {
         }
         private fn trim() {                         // drops the idle half of the cache (any order is fine)
             let gone = new Array<string>();
-            for (k in self.cache.keys()) {
-                let st = self.cache[k];
+            for ((k, st) in self.cache) {
                 if (!st.__inUse && gone.size() < 64) { gone.push(k); }
             }
             for (k in gone) { self.cache[k].close(); self.cache.remove(k); }
