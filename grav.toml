@@ -1,6 +1,6 @@
 name = "grav-db"
 lib = "src/db.grav"
-grav = ">=1.7.0"
+grav = ">=1.9.0"
 paths = ["src"]
 
 [dependencies]
