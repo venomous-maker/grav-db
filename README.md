@@ -27,7 +27,7 @@ grav add ../grav-db
 
 which writes `grav-db = { path = "../grav-db" }` to your `grav.toml`. Then:
 
-```grav
+```typescript
 import "std"
 import "grav-db"
 
@@ -44,7 +44,7 @@ fn main() {
 
 For a server, open a URL instead; the rest is the same:
 
-```grav
+```typescript
 let my = MySql.open("mysql://app:secret@localhost/shop")
 let pg = Postgres.open("postgresql://app:secret@localhost/shop")
 ```
