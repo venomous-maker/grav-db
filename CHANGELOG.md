@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.2.1 (2026-11-27)
+
 ### Fixes
 
 - A MySQL, MariaDB or PostgreSQL connection the server dropped while it sat idle (MySQL's
