@@ -446,6 +446,13 @@ namespace db {
         static fn open(url: string) -> MySqlConnection { return MySql.connect(MySql.parseUrl(url)); }
         // Connects with `o`, in utf8mb4.
         static fn connect(o: MySqlOptions) -> MySqlConnection {
+            let h = MySql.handshake(o);
+            let conn = new MySqlConnection(%{ grav_my_conn_new(h) %} as byte*, o.toString());
+            conn.options = o;
+            return conn;
+        }
+        // A new client handle connected with `o` (a MYSQL*), or a DbError.
+        static fn handshake(o: MySqlOptions) -> byte* {
             MySql.need();
             let host = o.host;
             let user = o.user;
@@ -470,7 +477,7 @@ namespace db {
                 %{ grav_my.close(m); %};
                 throw new DbError("cannot connect to " + o.toString() + ": " + why, code, "");
             }
-            return new MySqlConnection(%{ grav_my_conn_new(m) %} as byte*, o.toString());
+            return m;
         }
         // The options a URL gives (see open).
         static fn parseUrl(url: string) -> MySqlOptions {
@@ -536,8 +543,17 @@ namespace db {
         private cache: HashMap<string, MySqlStatement>
         private recent: Array<MySqlStatement>    // 16 of the cached, by their SQL string's address (no hashing)
         private openFlag: bool
+        private lastUsedMs: long
         // Where it is connected ("mysql://app@localhost:3306/shop").
         public url: string
+        // How it connected (set by MySql.connect): what a reconnect uses.
+        public options: MySqlOptions = null
+        // After this many idle milliseconds the next use checks the server still
+        // answers (MySQL drops connections idle past its wait_timeout, 8 hours by
+        // default), and reconnects when it does not; 0 never checks.
+        public checkIdleMs: long = 30000
+        // How many times it has reconnected.
+        public reconnects: int = 0
 
         constructor(c: byte*, url: string) {
             super();
@@ -547,6 +563,7 @@ namespace db {
             self.recent = new Array<MySqlStatement>(16);
             for (i in 0..16) { self.recent.push(null); }
             self.openFlag = true;
+            self.lastUsedMs = Time.monotonicMs();
         }
         destructor() {
             self.close();
@@ -557,6 +574,7 @@ namespace db {
         // A new statement for `sql` (yours to run and close).
         fn prepare(sql: string) -> Statement { return self.make(sql); }
         fn exec(sql: string) {
+            self.revive();
             let m = self.handle();
             let code = %{ grav_my.real_query(m, sql, (unsigned long)grav_str_len(sql)) ? grav_my.errnum(m) : 0 %} as int;
             if (code == 0) {
@@ -591,6 +609,7 @@ namespace db {
         // The cached statement for `sql` (a statement is safe to run again inside
         // its own each(): its rows are read before they are handed out).
         protected fn borrow(sql: string) -> Statement {
+            self.revive();
             let slot = %{ (int)(((unsigned long)sql >> 4) & 15) %} as int;
             let st = self.recent[slot];
             if (st != null) { let had = st.sql; if (%{ had == sql %} as bool) { return st; } }   // (the very string: same SQL)
@@ -612,11 +631,28 @@ namespace db {
         }
 
         private fn make(sql: string) -> MySqlStatement {
+            self.revive();
             self.handle();
             let c = self.c;
             return new MySqlStatement(sql, %{ grav_my_stmt_new((grav_my_conn*)c, sql) %} as byte*);
         }
         private fn error(sql: string) -> DbError { return MySql.error(self.handle(), sql); }
+        // Before a use: when it has been idle a while (and holds no transaction, which a
+        // new connection could not carry on), checks the server still answers, and when
+        // it does not, connects again in place. Statements made on it keep working: they
+        // reach the server through the same connection record.
+        private fn revive() {
+            let now = Time.monotonicMs();
+            let idle = now - self.lastUsedMs;
+            self.lastUsedMs = now;
+            if (self.checkIdleMs <= 0 || idle < self.checkIdleMs || !self.openFlag || self.options == null || self.inTransaction()) { return; }
+            if (self.ping()) { return; }
+            let fresh = MySql.handshake(self.options);
+            let c = self.c;
+            %{ grav_my_conn* k = (grav_my_conn*)c; if (k->m) grav_my.close(k->m); k->m = fresh; %};
+            self.reconnects += 1;
+            self.lastUsedMs = Time.monotonicMs();
+        }
         private fn handle() -> byte* {
             if (!self.openFlag) { throw new StateError("the MySQL connection to " + self.url + " is closed"); }
             let c = self.c;

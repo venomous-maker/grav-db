@@ -6,6 +6,16 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Fixes
+
+- A MySQL, MariaDB or PostgreSQL connection the server dropped while it sat idle (MySQL's
+  `wait_timeout`, 8 hours by default; a restart; a proxy's or firewall's idle limit;
+  PostgreSQL's `idle_session_timeout`) reconnects on its next use instead of failing every
+  query with "server has gone away". After `checkIdleMs` (30 s) without use, the next query
+  pings the server first; a connection in a transaction never reconnects (the transaction
+  would be lost without a word), and statements made before keep working (PostgreSQL ones
+  are prepared again). `reconnects` counts how often it happened.
+
 ## 0.2.0 (2026-11-20)
 
 ### Requirements

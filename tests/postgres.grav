@@ -247,3 +247,31 @@ test "executeMany sends simple INSERTs as multi-row ones" {
     assertEq(Postgres.valuesTuple("INSERT INTO t (a) SELECT ? WHERE ? > 0"), "")
     assertEq(Postgres.valuesTuple("UPDATE t SET a = ? WHERE b = ?"), "")
 }
+
+test "a connection the server dropped while idle reconnects on its next use" {
+    let db = server()
+    if (db == null) { return }
+    db.checkIdleMs = 500
+    // Prepared on the server in this session: a cached statement and one held here.
+    assertEq(db.queryValue("SELECT 40 + 2") as long, 42 as long)
+    let st = db.prepare("SELECT ? + 1 AS n")
+    assertEq(st.queryOne([1]).getInt("n"), 2 as long)
+    let before = db.queryValue("SELECT pg_backend_pid()") as long
+    // The server ends this session after a second without a query.
+    db.exec("SET idle_session_timeout = 1000")
+    Time.sleepMs(2500)
+    assertEq(db.queryValue("SELECT 40 + 2") as long, 42 as long)     // (prepared again on the new session)
+    assertEq(db.reconnects, 1)
+    assertEq((db.queryValue("SELECT pg_backend_pid()") as long) != before, true)
+    assertEq(st.queryOne([41]).getInt("n"), 42 as long)
+    // Inside a transaction it does not: the transaction would be lost without a word.
+    db.exec("SET idle_in_transaction_session_timeout = 1000")
+    db.begin()
+    db.queryValue("SELECT 1")
+    Time.sleepMs(2500)
+    let failed = false
+    try { db.queryValue("SELECT 1") } catch (e: DbError) { failed = true }
+    assertEq(failed, true)
+    assertEq(db.reconnects, 1)
+    db.close()
+}

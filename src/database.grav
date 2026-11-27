@@ -319,7 +319,7 @@ namespace db {
         // none does; the number of rows changed. Drivers batch the runs: MySQL
         // sends an INSERT's rows as one multi-row INSERT, PostgreSQL pipelines them.
         fn executeMany(sql: string, rows: Array<Array<any>>) -> long {
-            if (rows.size() == 0) { return 0; }
+            if (rows.isEmpty()) { return 0; }
             self.begin();
             let n = 0 as long;
             try { n = self.batch(sql, rows); } catch (e: Exception) { self.rollback(); throw e; }
@@ -412,7 +412,7 @@ namespace db {
             self.slots.acquire();
             self.lock.lock();
             let c: Connection = null;
-            while (self.idle.size() > 0 && c == null) {
+            while (!self.idle.isEmpty() && c == null) {
                 let x = self.idle.pop();
                 if (x.isOpen()) { c = x; }
             }

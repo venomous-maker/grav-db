@@ -128,6 +128,7 @@ namespace db {
         void* pg;
         int refs;
         unsigned next;                                 /* for statement names */
+        unsigned gen;                                  /* the session: one more each reconnect */
         long long changes;                             /* rows the last statement changed */
         pthread_mutex_t mu;
         char* pend;
@@ -143,6 +144,16 @@ namespace db {
     static void grav_pg_conn_close(grav_pg_conn* c) {
         pthread_mutex_lock(&c->mu);
         if (c->pg) { grav_pg.finish(c->pg); c->pg = 0; }
+        c->plen = 0;
+        pthread_mutex_unlock(&c->mu);
+    }
+    /* Swaps in a new session (a reconnect): the old one's statements and pending
+       DEALLOCATEs went with it, so statements prepare themselves again. */
+    static void grav_pg_conn_swap(grav_pg_conn* c, void* pg) {
+        pthread_mutex_lock(&c->mu);
+        if (c->pg) grav_pg.finish(c->pg);
+        c->pg = pg;
+        c->gen++;
         c->plen = 0;
         pthread_mutex_unlock(&c->mu);
     }
@@ -186,6 +197,7 @@ namespace db {
         grav_pg_conn* c;
         char* sql;
         int n, prepared;
+        unsigned gen;                                  /* the session it was prepared in */
         char name[24];
         unsigned* types;                               /* prepared with */
         unsigned* want;                                /* this run needs */
@@ -272,7 +284,8 @@ namespace db {
         return h;
     }
     static void grav_pg_stmt_release(grav_pg_stmt* h) {   /* forgets it on the server */
-        if (h->prepared && h->c) grav_pg_forget(h->c, h->name);
+        /* (one prepared before a reconnect went with the old session: nothing to deallocate) */
+        if (h->prepared && h->c && h->gen == h->c->gen) grav_pg_forget(h->c, h->name);
         h->prepared = 0;
     }
     static void grav_pg_stmt_free(grav_pg_stmt* h) {
@@ -318,7 +331,7 @@ namespace db {
     /* Prepares it on the server if it is not yet, or was with other parameter
        types: 0, or -1 with the failed result in h->err. */
     static int grav_pg_ready_stmt(grav_pg_stmt* h) {
-        if (h->prepared && !memcmp(h->types, h->want, (size_t)h->n * sizeof(unsigned))) return 0;
+        if (h->prepared && h->gen == h->c->gen && !memcmp(h->types, h->want, (size_t)h->n * sizeof(unsigned))) return 0;
         grav_pg_stmt_release(h);
         grav_pg_flush(h->c);
         snprintf(h->name, sizeof h->name, "grav_%u", h->c->next++);
@@ -327,6 +340,7 @@ namespace db {
         if (!r || grav_pg.resultStatus(r) != GRAV_PG_COMMAND) { h->err = r; return -1; }
         grav_pg.clear(r);
         h->prepared = 1;
+        h->gen = h->c->gen;
         return 0;
     }
     /* Runs it with the arguments set: its result, or null with the failure in h->err. */
@@ -441,6 +455,16 @@ namespace db {
         // query), or libpq's "host=... dbname=..." form. Unless it says otherwise,
         // waits 10 s at most for the server. The connection talks UTF-8.
         static fn open(url: string) -> PostgresConnection {
+            let pg = Postgres.handshake(url);
+            let host = %{ grav_pg_copy(grav_pg.host(pg), -1) %} as string;
+            let where = "postgresql://" + (%{ grav_pg_copy(grav_pg.user(pg), -1) %} as string) + "@" + host + ":" +
+                        (%{ grav_pg_copy(grav_pg.port(pg), -1) %} as string) + "/" + (%{ grav_pg_copy(grav_pg.db(pg), -1) %} as string);
+            let conn = new PostgresConnection(%{ grav_pg_conn_new(pg) %} as byte*, where);
+            conn.source = url;
+            return conn;
+        }
+        // A new libpq connection for `url` (a PGconn*), or a DbError.
+        static fn handshake(url: string) -> byte* {
             Postgres.need();
             let pg = %{ ({ const char* const keys[] = { "connect_timeout", "fallback_application_name", "dbname", "client_encoding", 0 };
                            const char* const vals[] = { "10", "grav", url, "UTF8", 0 };
@@ -452,10 +476,7 @@ namespace db {
                 throw new DbError("cannot connect to PostgreSQL: " + why, 0, "");
             }
             %{ grav_pg.setNoticeProcessor(pg, grav_pg_quiet, 0); %};
-            let host = %{ grav_pg_copy(grav_pg.host(pg), -1) %} as string;
-            let where = "postgresql://" + (%{ grav_pg_copy(grav_pg.user(pg), -1) %} as string) + "@" + host + ":" +
-                        (%{ grav_pg_copy(grav_pg.port(pg), -1) %} as string) + "/" + (%{ grav_pg_copy(grav_pg.db(pg), -1) %} as string);
-            return new PostgresConnection(%{ grav_pg_conn_new(pg) %} as byte*, where);
+            return pg;
         }
         private static fn need() {
             if (!Postgres.available()) { throw new StateError("PostgreSQL is not available: libpq could not be loaded"); }
@@ -468,8 +489,17 @@ namespace db {
         private cache: HashMap<string, PostgresStatement>
         private recent: Array<PostgresStatement>    // 16 of the cached, by their SQL string's address (no hashing)
         private openFlag: bool
+        private lastUsedMs: long
         // Where it is connected ("postgresql://app@/var/run/postgresql:5432/shop").
         public url: string
+        // What it was opened with (set by Postgres.open): what a reconnect uses.
+        public source: string = ""
+        // After this many idle milliseconds the next use checks the server still
+        // answers (a restart, a proxy's or firewall's idle limit, or the server's
+        // idle_session_timeout can drop it), and reconnects when it does not; 0 never checks.
+        public checkIdleMs: long = 30000
+        // How many times it has reconnected.
+        public reconnects: int = 0
 
         constructor(c: byte*, url: string) {
             super();
@@ -479,6 +509,7 @@ namespace db {
             self.recent = new Array<PostgresStatement>(16);
             for (i in 0..16) { self.recent.push(null); }
             self.openFlag = true;
+            self.lastUsedMs = Time.monotonicMs();
         }
         destructor() {
             self.close();
@@ -489,6 +520,7 @@ namespace db {
         // A new statement for `sql` (yours to run and close).
         fn prepare(sql: string) -> Statement { return self.make(sql); }
         fn exec(sql: string) {
+            self.revive();
             let pg = self.handle();
             let c = self.c;
             %{ grav_pg_flush((grav_pg_conn*)c); %};
@@ -543,6 +575,7 @@ namespace db {
         // The cached statement for `sql` (safe to run again inside its own each():
         // a result is read whole before its rows are handed out).
         protected fn borrow(sql: string) -> Statement {
+            self.revive();
             let slot = %{ (int)(((unsigned long)sql >> 4) & 15) %} as int;
             let st = self.recent[slot];
             if (st != null) { let had = st.sql; if (%{ had == sql %} as bool) { return st; } }   // (the very string: same SQL)
@@ -586,6 +619,7 @@ namespace db {
         }
 
         private fn make(sql: string) -> PostgresStatement {
+            self.revive();
             self.handle();
             let c = self.c;
             let h = %{ grav_pg_stmt_new((grav_pg_conn*)c, sql) %} as byte*;
@@ -594,6 +628,21 @@ namespace db {
                 throw new DbError("the SQL mixes ? and $n placeholders: use one kind", 0, sql);
             }
             return new PostgresStatement(sql, h);
+        }
+        // Before a use: when it has been idle a while (and holds no transaction, which a
+        // new session could not carry on), checks the server still answers, and when it
+        // does not, connects again in place; its statements prepare themselves again.
+        private fn revive() {
+            let now = Time.monotonicMs();
+            let idle = now - self.lastUsedMs;
+            self.lastUsedMs = now;
+            if (self.checkIdleMs <= 0 || idle < self.checkIdleMs || !self.openFlag || self.source == "" || self.inTransaction()) { return; }
+            if (self.ping()) { return; }
+            let fresh = Postgres.handshake(self.source);
+            let c = self.c;
+            %{ grav_pg_conn_swap((grav_pg_conn*)c, fresh); %};
+            self.reconnects += 1;
+            self.lastUsedMs = Time.monotonicMs();
         }
         private fn handle() -> byte* {
             if (!self.openFlag) { throw new StateError("the PostgreSQL connection to " + self.url + " is closed"); }

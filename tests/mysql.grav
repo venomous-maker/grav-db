@@ -264,3 +264,32 @@ test "DECIMAL as Decimal, JSON as JsonValue" {
     db.exec("DROP TABLE gdb_d")
     db.close()
 }
+
+test "a connection the server dropped while idle reconnects on its next use" {
+    let db = server()
+    if (db == null) { return }
+    db.checkIdleMs = 500
+    // The server closes this session after a second without a query (a short wait_timeout).
+    db.exec("SET SESSION wait_timeout = 1")
+    let before = db.queryValue("SELECT CONNECTION_ID()") as long
+    Time.sleepMs(2500)
+    assertEq(db.queryValue("SELECT 1 + 1") as long, 2 as long)
+    assertEq(db.reconnects, 1)
+    assertEq((db.queryValue("SELECT CONNECTION_ID()") as long) != before, true)
+    // A statement made before the drop runs on the new connection too.
+    db.exec("SET SESSION wait_timeout = 1")
+    let st = db.prepare("SELECT ? + 1 AS n")
+    Time.sleepMs(2500)
+    db.queryValue("SELECT 1")          // (the use that notices and reconnects)
+    assertEq(st.queryOne([41]).getInt("n"), 42 as long)
+    assertEq(db.reconnects, 2)
+    // Inside a transaction it does not: the transaction would be lost without a word.
+    db.exec("SET SESSION wait_timeout = 1")
+    db.begin()
+    Time.sleepMs(2500)
+    let failed = false
+    try { db.queryValue("SELECT 1") } catch (e: DbError) { failed = true }
+    assertEq(failed, true)
+    assertEq(db.reconnects, 2)
+    db.close()
+}
